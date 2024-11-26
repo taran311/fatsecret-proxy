@@ -12,6 +12,9 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
 let accessToken = null;
 
+console.log('Client ID:', CLIENT_ID);
+console.log('Client Secret:', CLIENT_SECRET);
+
 // Function to obtain a new access token
 const getAccessToken = async () => {
   try {
@@ -20,7 +23,7 @@ const getAccessToken = async () => {
         grant_type: 'client_credentials',
         client_id: CLIENT_ID,
         client_secret: CLIENT_SECRET,
-        scope: 'basic', // Add this line
+        scope: 'basic'
       },
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
