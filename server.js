@@ -18,21 +18,24 @@ console.log('Client Secret:', CLIENT_SECRET);
 // Function to obtain a new access token
 const getAccessToken = async () => {
   try {
-    const response = await axios.post('https://oauth.fatsecret.com/connect/token', null, {
-      params: {
+    const response = await axios.post(
+      'https://oauth.fatsecret.com/connect/token',
+      new URLSearchParams({
         grant_type: 'client_credentials',
         client_id: CLIENT_ID,
         client_secret: CLIENT_SECRET,
-        scope: 'basic'
-      },
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    });
+        scope: 'basic',
+      }).toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      }
+    );
     accessToken = response.data.access_token;
     return accessToken;
   } catch (err) {
-    console.error('Error fetching access token:', err.response.data);
+    console.error('Error fetching access token:', err.response?.data || err.message);
     throw err;
   }
 };
