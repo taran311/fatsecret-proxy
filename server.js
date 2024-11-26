@@ -12,6 +12,7 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
 let accessToken = null;
 
+// Debugging: Log client credentials
 console.log('Client ID:', CLIENT_ID);
 console.log('Client Secret:', CLIENT_SECRET);
 
@@ -48,27 +49,39 @@ app.use(async (req, res, next) => {
   next();
 });
 
-// Proxy endpoint to forward requests to FatSecret API
-app.post('/proxy', async (req, res) => {
+// Proxy endpoint for foods.search/v1
+app.get('/foods/search/v1', async (req, res) => {
+  const { search_expression, max_results, format } = req.query;
+
   try {
-    const response = await axios.post(FATSECRET_API_URL, req.body, {
+    const response = await axios.get(FATSECRET_API_URL, {
+      params: {
+        method: 'foods.search',
+        search_expression,
+        max_results,
+        format,
+      },
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
     });
+
     res.json(response.data);
   } catch (err) {
-    console.error('Error forwarding request:', err.response.data);
-    if (err.response.status === 401) {
+    console.error('Error forwarding request:', err.response?.data || err.message);
+
+    if (err.response?.status === 401) {
       // Access token expired, renew it
       await getAccessToken();
       return res.redirect(req.originalUrl); // Retry the request
     }
-    res.status(err.response.status).json(err.response.data);
+
+    res.status(err.response?.status || 500).json(err.response?.data || { error: 'Internal Server Error' });
   }
 });
 
+// Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
