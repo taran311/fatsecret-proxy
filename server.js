@@ -2,24 +2,23 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const compression = require('compression'); // For response compression
+const compression = require('compression'); // Enable compression
 const NodeCache = require('node-cache');
-const https = require('https');
 require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.json());
-app.use(compression()); // Enable compression for faster responses
+app.use(compression()); // Compress responses
 
-// Enable CORS with strict configuration
+// Enable CORS
 app.use(
   cors({
     origin: [
-      'https://thecaloriecard.com', // Allow production domain
-      'http://localhost:3000', // Allow localhost for development
+      'https://thecaloriecard.com', // Production domain
+      'http://localhost:3000', // Local development
     ],
-    methods: ['GET', 'POST'], // Allow only necessary methods
-    allowedHeaders: ['Content-Type', 'Authorization'], // Restrict headers
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
 
@@ -27,36 +26,23 @@ const FATSECRET_API_URL = 'https://platform.fatsecret.com/rest/server.api';
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-// Debugging: Log client credentials in development
-if (process.env.NODE_ENV !== 'production') {
-  console.log('Client ID:', CLIENT_ID);
-  console.log('Client Secret:', CLIENT_SECRET ? '*****' : 'Not Provided');
-}
-
 // Cache for storing API responses
 const cache = new NodeCache({ stdTTL: 300 }); // Cache duration: 5 minutes
 
-// Connection pooling
-const agent = new https.Agent({ keepAlive: true });
-const axiosInstance = axios.create({
-  timeout: 5000, // Set timeout to 5 seconds
-  httpsAgent: agent,
-});
-
 let accessToken = null;
-let tokenExpirationTime = null; // Store expiration time
+let tokenExpirationTime = null; // Track token expiration
 
-// Function to obtain a new access token
+// Function to fetch a new access token
 const getAccessToken = async () => {
   try {
     console.log('Fetching new access token...');
-    const response = await axiosInstance.post(
+    const response = await axios.post(
       'https://oauth.fatsecret.com/connect/token',
       new URLSearchParams({
         grant_type: 'client_credentials',
         client_id: CLIENT_ID,
         client_secret: CLIENT_SECRET,
-        scope: 'basic',
+        scope: 'basic', // Ensure the 'basic' scope is included
       }).toString(),
       {
         headers: {
@@ -66,41 +52,40 @@ const getAccessToken = async () => {
     );
     accessToken = response.data.access_token;
     tokenExpirationTime = Date.now() + response.data.expires_in * 1000; // Set expiration time
-    console.log('Access token fetched successfully.');
+    console.log('Access token fetched successfully:', accessToken);
   } catch (err) {
     console.error('Error fetching access token:', err.response?.data || err.message);
-    throw err;
+    throw new Error('Failed to fetch access token');
   }
 };
 
-// Periodically refresh access token
-const refreshTokenInterval = () => {
-  setInterval(async () => {
-    if (!accessToken || Date.now() >= tokenExpirationTime) {
-      try {
-        await getAccessToken();
-      } catch (err) {
-        console.error('Failed to refresh access token:', err.message);
-      }
+// Middleware to ensure a valid access token
+app.use(async (req, res, next) => {
+  if (!accessToken || Date.now() >= tokenExpirationTime) {
+    try {
+      await getAccessToken();
+    } catch (err) {
+      console.error('Failed to refresh access token:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch access token' });
     }
-  }, 300000); // Refresh every 5 minutes
-};
-refreshTokenInterval();
+  }
+  next();
+});
 
-// Proxy endpoint for foods.search/v1
+// Endpoint for foods.search
 app.get('/foods/search/v1', async (req, res) => {
   const { search_expression, max_results, format } = req.query;
   const cacheKey = `${search_expression}-${max_results}-${format}`;
 
-  // Check cache
+  // Check if data is cached
   const cachedData = cache.get(cacheKey);
   if (cachedData) {
-    console.log('Serving from cache:', cacheKey);
+    console.log('Serving data from cache:', cacheKey);
     return res.json(cachedData);
   }
 
   try {
-    const response = await axiosInstance.get(FATSECRET_API_URL, {
+    const response = await axios.get(FATSECRET_API_URL, {
       params: {
         method: 'foods.search',
         search_expression,
@@ -113,19 +98,18 @@ app.get('/foods/search/v1', async (req, res) => {
       },
     });
 
-    // Save to cache
+    // Cache the response
     cache.set(cacheKey, response.data);
     res.json(response.data);
   } catch (err) {
     console.error('Error forwarding request:', err.response?.data || err.message);
 
     if (err.response?.status === 401) {
-      // Access token expired, renew it
-      console.log('Access token expired. Renewing...');
+      // Retry on token expiration
+      console.log('Access token expired. Refreshing...');
       try {
         await getAccessToken();
-        // Retry the request after refreshing the token
-        const retryResponse = await axiosInstance.get(FATSECRET_API_URL, {
+        const retryResponse = await axios.get(FATSECRET_API_URL, {
           params: {
             method: 'foods.search',
             search_expression,
@@ -138,7 +122,7 @@ app.get('/foods/search/v1', async (req, res) => {
           },
         });
 
-        // Save to cache
+        // Cache the retry response
         cache.set(cacheKey, retryResponse.data);
         return res.json(retryResponse.data);
       } catch (retryError) {
