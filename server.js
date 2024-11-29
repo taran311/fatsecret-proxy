@@ -72,6 +72,11 @@ app.use(async (req, res, next) => {
   next();
 });
 
+// Endpoint for health check
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
 // Endpoint for foods.search
 app.get('/foods/search/v1', async (req, res) => {
   const { search_expression, max_results, format } = req.query;
@@ -139,4 +144,13 @@ app.get('/foods/search/v1', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+
+  // Keep-alive pings
+  setInterval(() => {
+    console.log('Sending keep-alive ping to /health');
+    axios
+      .get(`http://localhost:${PORT}/health`)
+      .then(() => console.log('Keep-alive ping successful'))
+      .catch((err) => console.error('Keep-alive ping failed:', err.message));
+  }, 5 * 60 * 1000); // Every 5 minutes
 });
