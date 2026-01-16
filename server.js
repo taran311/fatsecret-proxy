@@ -1,175 +1,156 @@
 const express = require('express');
 const axios = require('axios');
+const bodyParser = require('body-parser');
 const cors = require('cors');
-const compression = require('compression');
+const compression = require('compression'); // Enable compression
 const NodeCache = require('node-cache');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
-app.use(compression());
+app.use(bodyParser.json());
+app.use(compression()); // Compress responses
 
-// =====================
-// CORS (FIXED FOR FLUTTER WEB)
-// =====================
-const PROD_DOMAIN = 'https://thecaloriecard.com';
-
+// Enable CORS
 app.use(
   cors({
-    origin: (origin, callback) => {
-      // Allow non-browser tools (curl, server-to-server)
-      if (!origin) return callback(null, true);
-
-      // Allow ANY localhost port (Flutter Web uses random ports)
-      if (origin.startsWith('http://localhost')) {
-        return callback(null, true);
-      }
-
-      // Allow production domain
-      if (origin === PROD_DOMAIN) {
-        return callback(null, true);
-      }
-
-      return callback(new Error(`CORS blocked origin: ${origin}`));
-    },
-    credentials: true,
+    origin: [
+      'https://thecaloriecard.com', // Production domain
+      'http://localhost:64918', // Local development
+    ],
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
 
-// =====================
-// CONSTANTS
-// =====================
 const FATSECRET_API_URL = 'https://platform.fatsecret.com/rest/server.api';
-const TOKEN_URL = 'https://oauth.fatsecret.com/connect/token';
-
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-if (!CLIENT_ID || !CLIENT_SECRET) {
-  console.error('❌ Missing CLIENT_ID or CLIENT_SECRET');
-  process.exit(1);
-}
+// Cache for storing API responses
+const cache = new NodeCache({ stdTTL: 300 }); // Cache duration: 5 minutes
 
-// =====================
-// CACHE
-// =====================
-const cache = new NodeCache({ stdTTL: 300 }); // 5 minutes
-
-// =====================
-// TOKEN STATE (RACE-SAFE)
-// =====================
 let accessToken = null;
-let tokenExpiresAt = 0;
-let tokenPromise = null;
+let tokenExpirationTime = null; // Track token expiration
 
-// =====================
-// TOKEN FETCH
-// =====================
-async function fetchAccessToken() {
-  if (tokenPromise) return tokenPromise;
-
-  tokenPromise = axios
-    .post(
-      TOKEN_URL,
+// Function to fetch a new access token
+const getAccessToken = async () => {
+  try {
+    console.log('Fetching new access token...');
+    const response = await axios.post(
+      'https://oauth.fatsecret.com/connect/token',
       new URLSearchParams({
         grant_type: 'client_credentials',
         client_id: CLIENT_ID,
         client_secret: CLIENT_SECRET,
-        scope: 'basic',
+        scope: 'basic', // Ensure the 'basic' scope is included
       }).toString(),
       {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
       }
-    )
-    .then((res) => {
-      accessToken = res.data.access_token;
-      tokenExpiresAt = Date.now() + res.data.expires_in * 1000 - 30_000; // safety buffer
-      console.log('✅ FatSecret access token refreshed');
-      return accessToken;
-    })
-    .finally(() => {
-      tokenPromise = null;
-    });
-
-  return tokenPromise;
-}
-
-// =====================
-// TOKEN MIDDLEWARE
-// =====================
-async function ensureToken(req, res, next) {
-  try {
-    if (!accessToken || Date.now() >= tokenExpiresAt) {
-      await fetchAccessToken();
-    }
-    next();
+    );
+    accessToken = response.data.access_token;
+    tokenExpirationTime = Date.now() + response.data.expires_in * 1000; // Set expiration time
+    console.log('Access token fetched successfully:', accessToken);
   } catch (err) {
-    console.error('❌ Token error:', err.message);
-    res.status(500).json({ error: 'Authentication with FatSecret failed' });
+    console.error('Error fetching access token:', err.response?.data || err.message);
+    throw new Error('Failed to fetch access token');
   }
-}
+};
 
-app.use(ensureToken);
-
-// =====================
-// HEALTH CHECK
-// =====================
-app.get('/health', (_, res) => {
-  res.send('OK');
+// Middleware to ensure a valid access token
+app.use(async (req, res, next) => {
+  if (!accessToken || Date.now() >= tokenExpirationTime) {
+    try {
+      await getAccessToken();
+    } catch (err) {
+      console.error('Failed to refresh access token:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch access token' });
+    }
+  }
+  next();
 });
 
-// =====================
-// FOOD SEARCH ENDPOINT
-// =====================
-// Frontend calls:
-// GET /foods/search?q=apple
-app.get('/foods/search', async (req, res) => {
-  const query = req.query.q;
-  const maxResults = req.query.max ?? 10;
+// Endpoint for health check
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
 
-  if (!query) {
-    return res.status(400).json({ error: 'Missing query parameter: q' });
-  }
+// Endpoint for foods.search
+app.get('/foods/search/v1', async (req, res) => {
+  const { search_expression, max_results, format } = req.query;
+  const cacheKey = `${search_expression}-${max_results}-${format}`;
 
-  const cacheKey = `foods:${query}:${maxResults}`;
-  const cached = cache.get(cacheKey);
-  if (cached) {
-    return res.json(cached);
+  // Check if data is cached
+  const cachedData = cache.get(cacheKey);
+  if (cachedData) {
+    console.log('Serving data from cache:', cacheKey);
+    return res.json(cachedData);
   }
 
   try {
     const response = await axios.get(FATSECRET_API_URL, {
       params: {
         method: 'foods.search',
-        search_expression: query,
-        max_results: maxResults,
-        format: 'json',
+        search_expression,
+        max_results,
+        format,
       },
       headers: {
         Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
       },
     });
 
+    // Cache the response
     cache.set(cacheKey, response.data);
     res.json(response.data);
   } catch (err) {
-    console.error(
-      '❌ FatSecret request failed:',
-      err.response?.data || err.message
-    );
+    console.error('Error forwarding request:', err.response?.data || err.message);
 
-    res
-      .status(err.response?.status || 500)
-      .json({ error: 'Failed to fetch foods' });
+    if (err.response?.status === 401) {
+      // Retry on token expiration
+      console.log('Access token expired. Refreshing...');
+      try {
+        await getAccessToken();
+        const retryResponse = await axios.get(FATSECRET_API_URL, {
+          params: {
+            method: 'foods.search',
+            search_expression,
+            max_results,
+            format,
+          },
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+        });
+
+        // Cache the retry response
+        cache.set(cacheKey, retryResponse.data);
+        return res.json(retryResponse.data);
+      } catch (retryError) {
+        console.error('Failed after refreshing token:', retryError.message);
+        return res.status(500).json({ error: 'Failed to retry request after refreshing token' });
+      }
+    }
+
+    res.status(err.response?.status || 500).json(err.response?.data || { error: 'Internal Server Error' });
   }
 });
 
-// =====================
-// START SERVER
-// =====================
-const PORT = process.env.PORT || 10000;
+// Start the server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 FatSecret proxy running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
+
+  // Keep-alive pings
+  setInterval(() => {
+    console.log('Sending keep-alive ping to /health');
+    axios
+      .get(`http://localhost:${PORT}/health`)
+      .then(() => console.log('Keep-alive ping successful'))
+      .catch((err) => console.error('Keep-alive ping failed:', err.message));
+  }, 5 * 60 * 1000); // Every 5 minutes
 });
