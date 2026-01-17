@@ -17,6 +17,7 @@ app.use(
       'https://thecaloriecard.com', // Production domain
       'http://localhost:64918', // Local development
       'http://localhost:58291',
+      'http://localhost:58291',
     ],
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization'],
