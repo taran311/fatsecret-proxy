@@ -13,12 +13,18 @@ app.use(compression()); // Compress responses
 // Enable CORS
 app.use(
   cors({
-    origin: [
-      'https://thecaloriecard.com', // Production domain
-      'http://localhost:64918', // Local development
-      'http://localhost:58291',
-      'http://localhost:58291',
-    ],
+    origin: function (origin, callback) {
+      // Allow production domain
+      if (origin === 'https://thecaloriecard.com') {
+        return callback(null, true);
+      }
+      // Allow all localhost connections
+      if (!origin || origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) {
+        return callback(null, true);
+      }
+      // Deny all other origins
+      callback(new Error('Not allowed by CORS'));
+    },
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
