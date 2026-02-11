@@ -47,7 +47,7 @@ const cache = new NodeCache({ stdTTL: 300 }); // Cache duration: 5 minutes
 let accessToken = null;
 let tokenExpirationTime = null; // Track token expiration
 
-// OpenAI client (Render will inject env vars; locally you can use .env)
+// OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -164,10 +164,10 @@ app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
 });
 
 /**
- * Utility: extract grams from the user's free-text input.
+ * Utility: extract grams only if user explicitly typed g/gram/grams
  * Supports: "400g", "400 g", "400 gram", "400 grams"
  */
-function extractGrams(foodText) {
+function extractExplicitGrams(foodText) {
   const match = foodText.match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
   if (!match) return null;
   const grams = Number(match[1]);
@@ -177,9 +177,12 @@ function extractGrams(foodText) {
 /**
  * GPT nutrition estimation
  *
- * IMPORTANT: We force the model to return PER-100g values only.
- * If the user includes grams (e.g. "400g tofu"), we compute totals in code,
- * preventing inconsistencies like 100g vs 400g giving different per-100g bases.
+ * If user typed grams explicitly -> WEIGHT MODE:
+ *  - model returns per-100g values
+ *  - backend computes totals consistently
+ *
+ * Otherwise -> SERVING MODE:
+ *  - model estimates portion (e.g. "1 slice of bread") and returns totals for that serving
  */
 app.post("/estimate", async (req, res) => {
   try {
@@ -193,19 +196,21 @@ app.post("/estimate", async (req, res) => {
       return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
     }
 
-    const grams = extractGrams(food);
+    const grams = extractExplicitGrams(food);
+    const isWeightBased = grams !== null;
 
-    const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        {
-          role: "system",
-          content:
-            "You are a nutrition estimation system. Return ONLY valid JSON. Always return values strictly PER 100g for the described food. Do NOT scale totals to any quantity mentioned.",
-        },
-        {
-          role: "user",
-          content: `Food description: "${food}"
+    if (isWeightBased) {
+      const response = await openai.responses.create({
+        model: "gpt-4.1-mini",
+        input: [
+          {
+            role: "system",
+            content:
+              "You are a nutrition estimation system. Return ONLY valid JSON. Always return values strictly PER 100g for the described food. Do NOT scale totals to any quantity mentioned.",
+          },
+          {
+            role: "user",
+            content: `Food description: "${food}"
 
 Return JSON only in this exact shape:
 {
@@ -216,32 +221,60 @@ Return JSON only in this exact shape:
   "fat_per_100g": number,
   "confidence": number
 }`,
+          },
+        ],
+        text: { format: { type: "json_object" } },
+        temperature: 0.2,
+      });
+
+      const per100g = JSON.parse(response.output_text);
+      const factor = grams / 100;
+
+      return res.json({
+        mode: "weight",
+        ...per100g,
+        grams,
+        calories: Math.round(Number(per100g.calories_per_100g) * factor),
+        protein: Number((Number(per100g.protein_per_100g) * factor).toFixed(1)),
+        carbs: Number((Number(per100g.carbs_per_100g) * factor).toFixed(1)),
+        fat: Number((Number(per100g.fat_per_100g) * factor).toFixed(1)),
+      });
+    }
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "system",
+          content:
+            "You are a nutrition estimation system. Return ONLY valid JSON. If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup), estimate nutrition for that portion. If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
+        },
+        {
+          role: "user",
+          content: `Food description: "${food}"
+
+Return JSON only in this exact shape:
+{
+  "name": string,
+  "serving_description": string,
+  "estimated_serving_grams": number,
+  "calories": number,
+  "protein": number,
+  "carbs": number,
+  "fat": number,
+  "confidence": number
+}`,
         },
       ],
       text: { format: { type: "json_object" } },
       temperature: 0.2,
     });
 
-    const per100g = JSON.parse(response.output_text);
-
-    // Compute totals if grams provided
-    let totals = {};
-    if (grams !== null) {
-      const factor = grams / 100;
-
-      // calories as integer, macros to 1dp (you can change if you prefer)
-      totals = {
-        grams,
-        calories: Math.round(Number(per100g.calories_per_100g) * factor),
-        protein: Number((Number(per100g.protein_per_100g) * factor).toFixed(1)),
-        carbs: Number((Number(per100g.carbs_per_100g) * factor).toFixed(1)),
-        fat: Number((Number(per100g.fat_per_100g) * factor).toFixed(1)),
-      };
-    }
+    const perServing = JSON.parse(response.output_text);
 
     return res.json({
-      ...per100g,
-      ...totals,
+      mode: "serving",
+      ...perServing,
     });
   } catch (err) {
     console.error("Estimate error:", err?.response?.data || err.message || err);
@@ -254,12 +287,12 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 
-  // Keep-alive pings (optional; not needed on paid Render but harmless)
+  // Keep-alive pings (optional)
   setInterval(() => {
     console.log("Sending keep-alive ping to /health");
     axios
       .get(`http://localhost:${PORT}/health`)
       .then(() => console.log("Keep-alive ping successful"))
       .catch((err) => console.error("Keep-alive ping failed:", err.message));
-  }, 5 * 60 * 1000);
+  }, 5 * 60 * 1000); // Every 5 minutes
 });
