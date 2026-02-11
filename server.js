@@ -1,3 +1,9 @@
+import OpenAI from "openai";
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
 const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
@@ -162,3 +168,42 @@ app.listen(PORT, () => {
       .catch((err) => console.error('Keep-alive ping failed:', err.message));
   }, 5 * 60 * 1000); // Every 5 minutes
 });
+
+app.post("/estimate", async (req, res) => {
+  try {
+    const { food } = req.body;
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "system",
+          content: "You estimate nutrition for foods. Return only JSON.",
+        },
+        {
+          role: "user",
+          content: `Estimate calories and macros for: "${food}"
+
+Return JSON:
+{
+  "name": string,
+  "calories": number,
+  "protein": number,
+  "carbs": number,
+  "fat": number,
+  "confidence": number
+}`
+        }
+      ],
+      text: { format: { type: "json_object" } },
+      temperature: 0.2,
+    });
+
+    res.json(JSON.parse(response.output_text));
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Estimate failed" });
+  }
+});
+
