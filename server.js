@@ -11,9 +11,9 @@ dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
-app.use(compression());
+app.use(compression()); // Compress responses
 
-// ---- CORS ----
+// -------------------- CORS --------------------
 app.use(
   cors({
     origin: function (origin, callback) {
@@ -32,17 +32,17 @@ app.use(
   })
 );
 
-// ---- OpenAI ----
+// -------------------- Clients --------------------
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ---- FatSecret ----
+// -------------------- FatSecret --------------------
 const FATSECRET_API_URL = "https://platform.fatsecret.com/rest/server.api";
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-const cache = new NodeCache({ stdTTL: 300 });
+const cache = new NodeCache({ stdTTL: 300 }); // 5 minutes
 
 let accessToken = null;
 let tokenExpirationTime = null;
@@ -60,6 +60,7 @@ const getAccessToken = async () => {
       }).toString(),
       { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
     );
+
     accessToken = response.data.access_token;
     tokenExpirationTime = Date.now() + response.data.expires_in * 1000;
     console.log("Access token fetched successfully");
@@ -81,16 +82,19 @@ const ensureFatSecretToken = async (req, res, next) => {
   next();
 };
 
-// ---- Health ----
+// -------------------- Health --------------------
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// ---- FatSecret foods.search ----
+// -------------------- FatSecret foods.search --------------------
 app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
   const { search_expression, max_results, format } = req.query;
   const cacheKey = `${search_expression}-${max_results}-${format}`;
 
   const cachedData = cache.get(cacheKey);
-  if (cachedData) return res.json(cachedData);
+  if (cachedData) {
+    console.log("Serving data from cache:", cacheKey);
+    return res.json(cachedData);
+  }
 
   try {
     const response = await axios.get(FATSECRET_API_URL, {
@@ -107,11 +111,12 @@ app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
     });
 
     cache.set(cacheKey, response.data);
-    res.json(response.data);
+    return res.json(response.data);
   } catch (err) {
     console.error("Error forwarding request:", err.response?.data || err.message);
 
     if (err.response?.status === 401) {
+      console.log("Access token expired. Refreshing...");
       try {
         await getAccessToken();
         const retryResponse = await axios.get(FATSECRET_API_URL, {
@@ -131,23 +136,28 @@ app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
         return res.json(retryResponse.data);
       } catch (retryError) {
         console.error("Failed after refreshing token:", retryError.message);
-        return res.status(500).json({ error: "Failed to retry request after refreshing token" });
+        return res.status(500).json({
+          error: "Failed to retry request after refreshing token",
+        });
       }
     }
 
-    res.status(err.response?.status || 500).json(err.response?.data || { error: "Internal Server Error" });
+    return res
+      .status(err.response?.status || 500)
+      .json(err.response?.data || { error: "Internal Server Error" });
   }
 });
 
-// ---- Estimate helpers ----
+// -------------------- Estimate helpers --------------------
 function extractExplicitGrams(foodText) {
-  const match = foodText.match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
+  // Only triggers if the user explicitly typed g/gram/grams
+  const match = String(foodText).match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
   if (!match) return null;
   const grams = Number(match[1]);
   return Number.isFinite(grams) ? grams : null;
 }
 
-// ---- GPT: /estimate ----
+// -------------------- GPT: /estimate --------------------
 app.post("/estimate", async (req, res) => {
   try {
     const { food } = req.body;
@@ -233,21 +243,30 @@ Return JSON:
       ],
     });
 
-    return res.json({ mode: "serving", ...JSON.parse(response.output_text) });
+    return res.json({
+      mode: "serving",
+      ...JSON.parse(response.output_text),
+    });
   } catch (err) {
     console.error("Estimate error:", err?.response?.data || err.message || err);
-    res.status(500).json({ error: "Estimate failed" });
+    return res.status(500).json({ error: "Estimate failed" });
   }
 });
 
-// ---- Macro targets helpers ----
+// -------------------- Macro helpers --------------------
 function activityFactor(exerciseLevel) {
   const key = String(exerciseLevel || "").trim().toLowerCase();
   if (key === "no activity") return 1.2;
   if (key === "1-3 hours per week") return 1.375;
   if (key === "4-6 hours per week") return 1.55;
   if (key === "7-9 hours per week") return 1.725;
-  if (key === "10 hour+ per week" || key === "10 hours+ per week" || key === "10+ hours per week") return 1.9;
+  if (
+    key === "10 hour+ per week" ||
+    key === "10 hours+ per week" ||
+    key === "10+ hours per week"
+  )
+    return 1.9;
+
   return 1.2;
 }
 
@@ -256,7 +275,7 @@ function bmrMifflin({ gender, weightKg, heightCm, age }) {
   const base = 10 * weightKg + 6.25 * heightCm - 5 * age;
   if (g === "male" || g === "m") return base + 5;
   if (g === "female" || g === "f") return base - 161;
-  return base - 78; // neutral fallback
+  return base - 78; // neutral-ish fallback
 }
 
 function buildMacros({ calories, weightKg, protein_g_per_kg, fat_pct }) {
@@ -272,7 +291,21 @@ function buildMacros({ calories, weightKg, protein_g_per_kg, fat_pct }) {
   return { calories, protein_g, carbs_g, fat_g };
 }
 
-// ---- GPT-verified macro targets ----
+function clampNumber(n, min, max) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return null;
+  return Math.min(max, Math.max(min, x));
+}
+
+function normalizeStatus(s) {
+  const v = String(s || "").trim().toLowerCase();
+  if (v === "verified") return "verified";
+  if (v === "verified_with_suggestions") return "verified_with_suggestions";
+  if (v === "adjusted") return "adjusted";
+  return "verified_with_suggestions";
+}
+
+// -------------------- GPT-verified macro targets --------------------
 app.post("/macro-targets", async (req, res) => {
   try {
     const { age, gender, height_cm, weight_kg, exercise_level } = req.body || {};
@@ -294,7 +327,7 @@ app.post("/macro-targets", async (req, res) => {
       return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
     }
 
-    // Baseline (code)
+    // ---- Baseline calculation (code) ----
     const bmr = Math.round(bmrMifflin({ gender, weightKg, heightCm, age: ageNum }));
     const tdee = Math.round(bmr * activityFactor(exercise_level));
 
@@ -303,17 +336,38 @@ app.post("/macro-targets", async (req, res) => {
     const gainCalories = tdee + 300;
 
     const baseline = {
-      inputs: { age: ageNum, gender, height_cm: heightCm, weight_kg: weightKg, exercise_level },
+      inputs: {
+        age: ageNum,
+        gender,
+        height_cm: heightCm,
+        weight_kg: weightKg,
+        exercise_level,
+      },
       bmr,
       tdee,
       targets: {
-        lose: buildMacros({ calories: loseCalories, weightKg, protein_g_per_kg: 2.0, fat_pct: 0.25 }),
-        maintain: buildMacros({ calories: maintainCalories, weightKg, protein_g_per_kg: 1.8, fat_pct: 0.27 }),
-        gain: buildMacros({ calories: gainCalories, weightKg, protein_g_per_kg: 1.8, fat_pct: 0.22 }),
+        lose: buildMacros({
+          calories: loseCalories,
+          weightKg,
+          protein_g_per_kg: 2.0,
+          fat_pct: 0.25,
+        }),
+        maintain: buildMacros({
+          calories: maintainCalories,
+          weightKg,
+          protein_g_per_kg: 1.8,
+          fat_pct: 0.27,
+        }),
+        gain: buildMacros({
+          calories: gainCalories,
+          weightKg,
+          protein_g_per_kg: 1.8,
+          fat_pct: 0.22,
+        }),
       },
     };
 
-    // Verify with GPT (bounded)
+    // ---- AI verification (should NOT change numbers unless rules violated) ----
     const aiResponse = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0,
@@ -322,24 +376,34 @@ app.post("/macro-targets", async (req, res) => {
         {
           role: "system",
           content:
-            "You are a nutrition coach and calculator auditor. VERIFY the provided targets. " +
-            "Do not invent new formulas. Only make small adjustments if baseline is clearly unreasonable. " +
-            "Hard rules: protein 1.2–2.4 g/kg; fat 20–35% of calories; carbs are remainder. " +
-            "Weight loss deficit usually 10–25% below TDEE; gain surplus 5–15% above TDEE. Return JSON only.",
+            "You are a nutrition calculator auditor.\n\n" +
+            "Your job is to VERIFY the baseline targets. Do NOT change any numbers if they are within the hard rules.\n\n" +
+            "Hard rules:\n" +
+            "- Protein must be 1.2–2.4 g/kg/day\n" +
+            "- Fat must be 20–35% of calories\n" +
+            "- Loss calories should be 10–25% below TDEE\n" +
+            "- Gain calories should be 5–15% above TDEE\n" +
+            "- Carbs are the remainder\n\n" +
+            "Output rules:\n" +
+            '- If all targets pass hard rules, set status="verified" and final MUST equal baseline exactly.\n' +
+            '- If targets pass hard rules but you have optional improvements, set status="verified_with_suggestions", final MUST equal baseline exactly, and list suggestions in suggestions[].\n' +
+            '- Only if baseline violates hard rules, set status="adjusted" and modify final minimally to comply.\n' +
+            "Return JSON only.",
         },
         {
           role: "user",
           content: `Inputs:
 ${JSON.stringify(baseline.inputs)}
 
-Baseline:
+Baseline calculation (from code):
 ${JSON.stringify(baseline, null, 2)}
 
-Return JSON:
+Return JSON ONLY with this shape:
 {
-  "verified": boolean,
+  "status": "verified" | "verified_with_suggestions" | "adjusted",
   "confidence": number,
   "issues": string[],
+  "suggestions": string[],
   "final": {
     "bmr": number,
     "tdee": number,
@@ -355,25 +419,49 @@ Return JSON:
       ],
     });
 
-    const verified = JSON.parse(aiResponse.output_text);
+    let ai = JSON.parse(aiResponse.output_text);
+
+    // ---- Normalize / enforce rules in code (so UI stays consistent) ----
+    ai.status = normalizeStatus(ai.status);
+    ai.confidence = clampNumber(ai.confidence, 0, 1) ?? 0.75;
+    ai.issues = Array.isArray(ai.issues) ? ai.issues : [];
+    ai.suggestions = Array.isArray(ai.suggestions) ? ai.suggestions : [];
+
+    // If status is verified* the final MUST be baseline (enforce regardless of model slip-ups)
+    const baselineFinal = {
+      bmr: baseline.bmr,
+      tdee: baseline.tdee,
+      targets: {
+        lose: baseline.targets.lose,
+        maintain: baseline.targets.maintain,
+        gain: baseline.targets.gain,
+      },
+    };
+
+    if (ai.status === "verified" || ai.status === "verified_with_suggestions") {
+      ai.final = baselineFinal;
+    } else {
+      // adjusted: make sure ai.final exists; if not, fall back to baselineFinal
+      if (!ai.final || !ai.final.targets) ai.final = baselineFinal;
+    }
 
     return res.json({
       mode: "verified_by_ai",
       baseline,
-      ai: verified,
+      ai,
     });
   } catch (err) {
     console.error("Macro targets error:", err?.response?.data || err.message || err);
-    res.status(500).json({ error: "Failed to calculate macro targets" });
+    return res.status(500).json({ error: "Failed to calculate macro targets" });
   }
 });
 
-// ---- Start server ----
+// -------------------- Start server --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 
-  // Optional keep-alive ping
+  // Optional keep-alive ping (harmless)
   setInterval(() => {
     axios.get(`http://localhost:${PORT}/health`).catch(() => {});
   }, 5 * 60 * 1000);
