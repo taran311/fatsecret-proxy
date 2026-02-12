@@ -1,3 +1,278 @@
+import dotenv from "dotenv";
+import express from "express";
+import axios from "axios";
+import bodyParser from "body-parser";
+import cors from "cors";
+import compression from "compression";
+import NodeCache from "node-cache";
+import OpenAI from "openai";
+
+dotenv.config();
+
+const app = express();
+app.use(bodyParser.json());
+app.use(compression());
+
+// ---- CORS ----
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (origin === "https://thecaloriecard.com") return callback(null, true);
+      if (
+        !origin ||
+        origin.startsWith("http://localhost:") ||
+        origin.startsWith("http://127.0.0.1:")
+      ) {
+        return callback(null, true);
+      }
+      callback(new Error("Not allowed by CORS"));
+    },
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// ---- OpenAI ----
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// ---- FatSecret ----
+const FATSECRET_API_URL = "https://platform.fatsecret.com/rest/server.api";
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+
+const cache = new NodeCache({ stdTTL: 300 });
+
+let accessToken = null;
+let tokenExpirationTime = null;
+
+const getAccessToken = async () => {
+  try {
+    console.log("Fetching new access token...");
+    const response = await axios.post(
+      "https://oauth.fatsecret.com/connect/token",
+      new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        scope: "basic",
+      }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    accessToken = response.data.access_token;
+    tokenExpirationTime = Date.now() + response.data.expires_in * 1000;
+    console.log("Access token fetched successfully");
+  } catch (err) {
+    console.error("Error fetching access token:", err.response?.data || err.message);
+    throw new Error("Failed to fetch access token");
+  }
+};
+
+const ensureFatSecretToken = async (req, res, next) => {
+  if (!accessToken || Date.now() >= tokenExpirationTime) {
+    try {
+      await getAccessToken();
+    } catch (err) {
+      console.error("Failed to refresh access token:", err.message);
+      return res.status(500).json({ error: "Failed to fetch access token" });
+    }
+  }
+  next();
+};
+
+// ---- Health ----
+app.get("/health", (req, res) => res.status(200).send("OK"));
+
+// ---- FatSecret foods.search ----
+app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
+  const { search_expression, max_results, format } = req.query;
+  const cacheKey = `${search_expression}-${max_results}-${format}`;
+
+  const cachedData = cache.get(cacheKey);
+  if (cachedData) return res.json(cachedData);
+
+  try {
+    const response = await axios.get(FATSECRET_API_URL, {
+      params: {
+        method: "foods.search",
+        search_expression,
+        max_results,
+        format,
+      },
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    cache.set(cacheKey, response.data);
+    res.json(response.data);
+  } catch (err) {
+    console.error("Error forwarding request:", err.response?.data || err.message);
+
+    if (err.response?.status === 401) {
+      try {
+        await getAccessToken();
+        const retryResponse = await axios.get(FATSECRET_API_URL, {
+          params: {
+            method: "foods.search",
+            search_expression,
+            max_results,
+            format,
+          },
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+        });
+
+        cache.set(cacheKey, retryResponse.data);
+        return res.json(retryResponse.data);
+      } catch (retryError) {
+        console.error("Failed after refreshing token:", retryError.message);
+        return res.status(500).json({ error: "Failed to retry request after refreshing token" });
+      }
+    }
+
+    res.status(err.response?.status || 500).json(err.response?.data || { error: "Internal Server Error" });
+  }
+});
+
+// ---- Estimate helpers ----
+function extractExplicitGrams(foodText) {
+  const match = foodText.match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
+  if (!match) return null;
+  const grams = Number(match[1]);
+  return Number.isFinite(grams) ? grams : null;
+}
+
+// ---- GPT: /estimate ----
+app.post("/estimate", async (req, res) => {
+  try {
+    const { food } = req.body;
+
+    if (!food || typeof food !== "string") {
+      return res.status(400).json({ error: "food is required" });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
+    }
+
+    const grams = extractExplicitGrams(food);
+    const isWeightBased = grams !== null;
+
+    if (isWeightBased) {
+      const response = await openai.responses.create({
+        model: "gpt-4.1-mini",
+        temperature: 0.2,
+        text: { format: { type: "json_object" } },
+        input: [
+          {
+            role: "system",
+            content:
+              "Return ONLY valid JSON. Always return values strictly PER 100g for the described food. Do NOT scale totals to any quantity mentioned.",
+          },
+          {
+            role: "user",
+            content: `Food description: "${food}"
+
+Return JSON:
+{
+  "name": string,
+  "calories_per_100g": number,
+  "protein_per_100g": number,
+  "carbs_per_100g": number,
+  "fat_per_100g": number,
+  "confidence": number
+}`,
+          },
+        ],
+      });
+
+      const per100g = JSON.parse(response.output_text);
+      const factor = grams / 100;
+
+      return res.json({
+        mode: "weight",
+        ...per100g,
+        grams,
+        calories: Math.round(Number(per100g.calories_per_100g) * factor),
+        protein: Number((Number(per100g.protein_per_100g) * factor).toFixed(1)),
+        carbs: Number((Number(per100g.carbs_per_100g) * factor).toFixed(1)),
+        fat: Number((Number(per100g.fat_per_100g) * factor).toFixed(1)),
+      });
+    }
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      text: { format: { type: "json_object" } },
+      input: [
+        {
+          role: "system",
+          content:
+            "Return ONLY valid JSON. If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup), estimate nutrition for that portion. If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
+        },
+        {
+          role: "user",
+          content: `Food description: "${food}"
+
+Return JSON:
+{
+  "name": string,
+  "serving_description": string,
+  "estimated_serving_grams": number,
+  "calories": number,
+  "protein": number,
+  "carbs": number,
+  "fat": number,
+  "confidence": number
+}`,
+        },
+      ],
+    });
+
+    return res.json({ mode: "serving", ...JSON.parse(response.output_text) });
+  } catch (err) {
+    console.error("Estimate error:", err?.response?.data || err.message || err);
+    res.status(500).json({ error: "Estimate failed" });
+  }
+});
+
+// ---- Macro targets helpers ----
+function activityFactor(exerciseLevel) {
+  const key = String(exerciseLevel || "").trim().toLowerCase();
+  if (key === "no activity") return 1.2;
+  if (key === "1-3 hours per week") return 1.375;
+  if (key === "4-6 hours per week") return 1.55;
+  if (key === "7-9 hours per week") return 1.725;
+  if (key === "10 hour+ per week" || key === "10 hours+ per week" || key === "10+ hours per week") return 1.9;
+  return 1.2;
+}
+
+function bmrMifflin({ gender, weightKg, heightCm, age }) {
+  const g = String(gender || "").trim().toLowerCase();
+  const base = 10 * weightKg + 6.25 * heightCm - 5 * age;
+  if (g === "male" || g === "m") return base + 5;
+  if (g === "female" || g === "f") return base - 161;
+  return base - 78; // neutral fallback
+}
+
+function buildMacros({ calories, weightKg, protein_g_per_kg, fat_pct }) {
+  const protein_g = Math.round(weightKg * protein_g_per_kg);
+  const protein_kcal = protein_g * 4;
+
+  const fat_kcal = Math.round(calories * fat_pct);
+  const fat_g = Math.round(fat_kcal / 9);
+
+  const remaining_kcal = calories - protein_kcal - fat_g * 9;
+  const carbs_g = Math.max(0, Math.round(remaining_kcal / 4));
+
+  return { calories, protein_g, carbs_g, fat_g };
+}
+
+// ---- GPT-verified macro targets ----
 app.post("/macro-targets", async (req, res) => {
   try {
     const { age, gender, height_cm, weight_kg, exercise_level } = req.body || {};
@@ -7,19 +282,19 @@ app.post("/macro-targets", async (req, res) => {
     const weightKg = Number(weight_kg);
 
     if (!Number.isFinite(ageNum) || ageNum < 13 || ageNum > 90) {
-      return res.status(400).json({ error: "age must be a number between 13 and 90" });
+      return res.status(400).json({ error: "age must be 13–90" });
     }
     if (!Number.isFinite(heightCm) || heightCm < 120 || heightCm > 230) {
-      return res.status(400).json({ error: "height_cm must be a number between 120 and 230" });
+      return res.status(400).json({ error: "height_cm must be 120–230" });
     }
     if (!Number.isFinite(weightKg) || weightKg < 35 || weightKg > 250) {
-      return res.status(400).json({ error: "weight_kg must be a number between 35 and 250" });
+      return res.status(400).json({ error: "weight_kg must be 35–250" });
     }
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
     }
 
-    // --- Step 1: compute deterministic baseline in code ---
+    // Baseline (code)
     const bmr = Math.round(bmrMifflin({ gender, weightKg, heightCm, age: ageNum }));
     const tdee = Math.round(bmr * activityFactor(exercise_level));
 
@@ -28,13 +303,7 @@ app.post("/macro-targets", async (req, res) => {
     const gainCalories = tdee + 300;
 
     const baseline = {
-      inputs: {
-        age: ageNum,
-        gender,
-        height_cm: heightCm,
-        weight_kg: weightKg,
-        exercise_level,
-      },
+      inputs: { age: ageNum, gender, height_cm: heightCm, weight_kg: weightKg, exercise_level },
       bmr,
       tdee,
       targets: {
@@ -44,7 +313,7 @@ app.post("/macro-targets", async (req, res) => {
       },
     };
 
-    // --- Step 2: Verify/Sanity-check with GPT (bounded adjustments) ---
+    // Verify with GPT (bounded)
     const aiResponse = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0,
@@ -53,21 +322,20 @@ app.post("/macro-targets", async (req, res) => {
         {
           role: "system",
           content:
-            "You are a nutrition coach and calculator auditor. Your job is to VERIFY the provided calorie and macro targets. " +
-            "Do not invent new formulas. Only make small adjustments if the baseline is clearly unreasonable. " +
-            "Hard rules: protein must be between 1.2 and 2.4 g/kg; fat must be between 0.6 and 1.2 g/kg OR 20–35% of calories; carbs are the remainder. " +
-            "For weight loss, deficit should usually be 10–25% below TDEE; for gain, surplus 5–15% above TDEE. " +
-            "Return JSON only.",
+            "You are a nutrition coach and calculator auditor. VERIFY the provided targets. " +
+            "Do not invent new formulas. Only make small adjustments if baseline is clearly unreasonable. " +
+            "Hard rules: protein 1.2–2.4 g/kg; fat 20–35% of calories; carbs are remainder. " +
+            "Weight loss deficit usually 10–25% below TDEE; gain surplus 5–15% above TDEE. Return JSON only.",
         },
         {
           role: "user",
           content: `Inputs:
 ${JSON.stringify(baseline.inputs)}
 
-Baseline calculation (from code):
+Baseline:
 ${JSON.stringify(baseline, null, 2)}
 
-Return JSON in this exact shape:
+Return JSON:
 {
   "verified": boolean,
   "confidence": number,
@@ -89,7 +357,6 @@ Return JSON in this exact shape:
 
     const verified = JSON.parse(aiResponse.output_text);
 
-    // We return both baseline + AI-verified final so you can display "Verified by AI"
     return res.json({
       mode: "verified_by_ai",
       baseline,
@@ -97,6 +364,17 @@ Return JSON in this exact shape:
     });
   } catch (err) {
     console.error("Macro targets error:", err?.response?.data || err.message || err);
-    return res.status(500).json({ error: "Failed to calculate macro targets" });
+    res.status(500).json({ error: "Failed to calculate macro targets" });
   }
+});
+
+// ---- Start server ----
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+
+  // Optional keep-alive ping
+  setInterval(() => {
+    axios.get(`http://localhost:${PORT}/health`).catch(() => {});
+  }, 5 * 60 * 1000);
 });
