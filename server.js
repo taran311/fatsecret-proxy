@@ -294,6 +294,8 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     }
 
     // 2) AI layer: select best match + return ONE normalized card
+    // FIX: Only scale when candidate.description explicitly says "Per 100g".
+    // Never assume "Per 1 bar" or "Per serving" equals 100g.
     const selector = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0.1,
@@ -307,12 +309,19 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
             "- Choose the SINGLE best FatSecret candidate for the user's input.\n" +
             "- Use brand/name/description to match.\n" +
             "- If none are suitable, set use_fallback=true.\n\n" +
-            "Nutrition rules:\n" +
+            "Nutrition extraction:\n" +
             "- Prefer using numbers found in candidate.description.\n" +
-            "- candidate.description typically contains kcal/macros per 100g or per serving.\n" +
-            "- If user provided explicit grams (e.g. 150g) AND the description is per 100g, scale totals.\n" +
-            "- If description is per serving and user did not specify grams, use the serving values.\n" +
-            "- If you cannot reliably extract calories + at least 2 macros, set use_fallback=true.\n\n" +
+            "- candidate.description typically looks like:\n" +
+            '  "Per 100g - Calories: 165kcal | Fat: 3.6g | Carbs: 0g | Protein: 31g"\n' +
+            '  OR "Per 1 bar - Calories: 240kcal | Fat: 9g | Carbs: 36g | Protein: 2g"\n\n' +
+            "SCALING RULES (IMPORTANT):\n" +
+            "- ONLY scale by grams if the description explicitly says 'Per 100g'.\n" +
+            "- If description says 'Per 1 bar', 'Per serving', 'Per slice', etc., DO NOT scale.\n" +
+            "- If user provides grams but description is per-serving (not per-100g), return the per-serving values unchanged.\n" +
+            "- Set mode='weight' only when you are using a 'Per 100g' description and scaling by grams.\n" +
+            "- Otherwise set mode='serving'.\n\n" +
+            "Fallback rule:\n" +
+            "- If you cannot reliably extract calories and at least 2 macros from description, set use_fallback=true.\n\n" +
             "Output must match the schema exactly. confidence is 0..1.",
         },
         {
@@ -346,11 +355,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     const pick = safeJsonParse(selector.output_text);
     const modelConfidence = clamp01(pick?.confidence, 0);
 
-    // Minimum confidence threshold fallback:
-    // - invalid model output
-    // - model requests fallback
-    // - no candidate selected
-    // - confidence too low
+    // Minimum confidence threshold fallback
     if (
       !pick ||
       pick.use_fallback ||
