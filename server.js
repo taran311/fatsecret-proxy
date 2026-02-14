@@ -175,6 +175,31 @@ function extractPerMlFromDescription(desc) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+// ---- Extract pack-size grams from candidate name (generic) ----
+// Examples:
+// "French Fries Ready Salted (19.08g Bag)"
+// "Walkers Ready Salted Crisps (32.5g)"
+// "Chocolate Bar 51g"
+function extractPackSizeGramsFromName(name) {
+  const t = String(name || "");
+
+  // Look for "(19.08g ...)" or "(32.5g)" patterns
+  let m = t.match(/\((\d+(?:\.\d+)?)\s*g\b/i);
+  if (m) {
+    const g = Number(m[1]);
+    return Number.isFinite(g) && g > 0 ? g : null;
+  }
+
+  // Look for "51g" anywhere (but avoid catching "per 100g" which isn't in name usually)
+  m = t.match(/\b(\d+(?:\.\d+)?)\s*g\b/i);
+  if (m) {
+    const g = Number(m[1]);
+    return Number.isFinite(g) && g > 0 ? g : null;
+  }
+
+  return null;
+}
+
 // Detect “composite” multi-item inputs (e.g. "2 eggs and toast with butter").
 function looksComposite(text) {
   const t = String(text || "").toLowerCase();
@@ -195,13 +220,15 @@ function buildFatSecretCandidates(fsData) {
 
   return arr.slice(0, 12).map((f) => {
     const description = f.food_description || null;
+    const name = f.food_name;
     return {
       food_id: f.food_id,
-      name: f.food_name,
+      name,
       brand: f.brand_name || null,
       description,
       per_grams: extractPerGramsFromDescription(description),
       per_ml: extractPerMlFromDescription(description),
+      pack_grams: extractPackSizeGramsFromName(name), // <-- NEW
       type: f.food_type || null,
       url: f.food_url || null,
     };
@@ -209,19 +236,8 @@ function buildFatSecretCandidates(fsData) {
 }
 
 // -------------------- Generic mismatch guardrails --------------------
-//
-// Goal: avoid “product-type mismatches” without whack-a-mole per-item hacks.
-// We detect user intent *signals* and candidate *signals* and veto mismatches.
-//
-// Examples covered:
-// - Coffee shop drink size ("medium latte") vs at-home pods/capsules (Tassimo/Nespresso/etc.)
-// - Variant mismatch: user didn’t say "baked/zero/diet/light" but candidate is that variant
-//
 const TOKENS = {
-  // user size intent for drinks (in-store)
   drinkSizes: ["small", "medium", "large", "grande", "venti", "tall"],
-
-  // capsule / at-home coffee products
   capsule: [
     "tassimo",
     "nespresso",
@@ -235,9 +251,6 @@ const TOKENS = {
     "capsule",
     "capsules",
   ],
-
-  // variant tokens that frequently cause wrong selection when user didn’t ask for them
-  // (keep this short and high-signal)
   variants: [
     "baked",
     "light",
@@ -257,9 +270,7 @@ function candidateText(c) {
 }
 
 function userImpliesInStoreDrink(userText) {
-  const u = normText(userText);
-  // size words are the strongest signal; also “latte/cappuccino/flat white” with a size is common
-  return includesAny(u, TOKENS.drinkSizes);
+  return includesAny(userText, TOKENS.drinkSizes);
 }
 
 function candidateLooksCapsuleProduct(c) {
@@ -274,34 +285,65 @@ function candidateIsVariant(c) {
   return includesAny(candidateText(c), TOKENS.variants);
 }
 
-function computeMismatch(userText, chosenCandidate) {
+function packSizeMismatch(userGrams, candidatePackGrams) {
+  if (!Number.isFinite(Number(userGrams)) || !Number.isFinite(Number(candidatePackGrams)))
+    return false;
+
+  const u = Number(userGrams);
+  const p = Number(candidatePackGrams);
+  if (u <= 0 || p <= 0) return false;
+
+  // Relative difference threshold: > 20% mismatch means likely wrong pack size
+  const rel = Math.abs(p - u) / u;
+  return rel > 0.2;
+}
+
+function computeMismatch(userText, chosenCandidate, { explicitGrams }) {
   const mismatches = [];
 
-  // Coffee shop size query should not map to capsule products.
   if (userImpliesInStoreDrink(userText) && candidateLooksCapsuleProduct(chosenCandidate)) {
-    mismatches.push("coffee_shop_size_vs_capsule_product");
+    mismatches.push("product_type_mismatch_drink_format");
   }
 
-  // If user didn’t ask for variant, avoid variant products (baked/zero/light/etc.).
   if (!userAsksForVariant(userText) && candidateIsVariant(chosenCandidate)) {
     mismatches.push("variant_mismatch_user_unspecified");
+  }
+
+  // NEW: explicit grams vs pack size mismatch
+  // If user typed grams but candidate is a specific pack size that differs greatly, veto.
+  if (
+    explicitGrams !== null &&
+    chosenCandidate?.pack_grams !== null &&
+    packSizeMismatch(explicitGrams, chosenCandidate.pack_grams)
+  ) {
+    mismatches.push("explicit_weight_vs_pack_size_mismatch");
   }
 
   return mismatches;
 }
 
-function filterCandidatesByMismatches(candidates, userText, mismatches) {
+function filterCandidatesByMismatches(candidates, userText, mismatches, { explicitGrams }) {
   if (!mismatches.length) return candidates;
 
   return candidates.filter((c) => {
-    // Remove capsule-like candidates if mismatch type says so.
-    if (mismatches.includes("coffee_shop_size_vs_capsule_product")) {
+    if (mismatches.includes("product_type_mismatch_drink_format")) {
       if (candidateLooksCapsuleProduct(c)) return false;
     }
-    // Remove variant candidates if mismatch type says so.
+
     if (mismatches.includes("variant_mismatch_user_unspecified")) {
       if (candidateIsVariant(c)) return false;
     }
+
+    if (mismatches.includes("explicit_weight_vs_pack_size_mismatch")) {
+      if (
+        explicitGrams !== null &&
+        c?.pack_grams !== null &&
+        packSizeMismatch(explicitGrams, c.pack_grams)
+      ) {
+        return false;
+      }
+    }
+
     return true;
   });
 }
@@ -417,7 +459,7 @@ Return JSON:
   };
 }
 
-// -------------------- AI selector (wrapped so we can retry with filtered candidates) --------------------
+// -------------------- AI selector --------------------
 async function selectFromCandidates({ food, grams, ml, candidates }) {
   const selector = await openai.responses.create({
     model: "gpt-4.1-mini",
@@ -434,7 +476,8 @@ async function selectFromCandidates({ food, grams, ml, candidates }) {
           "- If none are suitable, set use_fallback=true.\n\n" +
           "Candidate fields:\n" +
           "- candidate.per_grams is present if description contains 'Per {N}g'.\n" +
-          "- candidate.per_ml is present if description contains 'Per {N}ml'.\n\n" +
+          "- candidate.per_ml is present if description contains 'Per {N}ml'.\n" +
+          "- candidate.pack_grams may be present if candidate name includes an explicit pack size.\n\n" +
           "SCALING RULES:\n" +
           "- If user provided grams AND candidate.per_grams is present, scale by factor = grams / per_grams and set mode='weight'.\n" +
           "- If user provided ml AND candidate.per_ml is present, scale by factor = ml / per_ml and set mode='volume'.\n" +
@@ -539,7 +582,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     let pick = await selectFromCandidates({ food, grams, ml, candidates });
     let modelConfidence = clamp01(pick?.confidence, 0);
 
-    // Early fallback if pick is bad
     const shouldFallbackInitial =
       !pick ||
       pick.use_fallback ||
@@ -569,7 +611,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       return res.json(fallback);
     }
 
-    // Validate chosen candidate exists
     let chosen = candidates[pick.chosen_index];
     if (!chosen) {
       const fallback = await estimateWithGPT(food);
@@ -578,13 +619,17 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     }
 
     // 3) Generic mismatch guardrail: if mismatch, retry with filtered candidates ONCE
-    const mismatches = computeMismatch(food, chosen);
+    const mismatches = computeMismatch(food, chosen, { explicitGrams: grams });
     let didRetry = false;
 
     if (mismatches.length) {
-      const filtered = filterCandidatesByMismatches(candidates, food, mismatches);
+      const filtered = filterCandidatesByMismatches(candidates, food, mismatches, {
+        explicitGrams: grams,
+      });
+
       if (filtered.length && filtered.length !== candidates.length) {
         didRetry = true;
+
         const retryPick = await selectFromCandidates({ food, grams, ml, candidates: filtered });
         const retryConfidence = clamp01(retryPick?.confidence, 0);
 
@@ -598,7 +643,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           modelConfidence = retryConfidence;
           chosen = filtered[retryPick.chosen_index] || chosen;
         } else {
-          // Retry failed → fallback to AI (better than wrong product-type)
           const fallback = await estimateWithGPT(food);
           if (debug) {
             fallback.debug = {
@@ -614,7 +658,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           return res.json(fallback);
         }
       } else {
-        // Nothing to filter, so safest is fallback
         const fallback = await estimateWithGPT(food);
         if (debug) {
           fallback.debug = {
@@ -652,6 +695,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
         chosen_description: chosen.description,
         chosen_per_grams: chosen.per_grams,
         chosen_per_ml: chosen.per_ml,
+        chosen_pack_grams: chosen.pack_grams,
         reason: pick.reason,
         candidate_count: candidates.length,
         threshold: FATSECRET_MIN_CONFIDENCE,
@@ -667,7 +711,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
   } catch (err) {
     console.error("Resolve error:", err?.response?.data || err.message || err);
 
-    // last-resort fallback if possible
     try {
       const { food } = req.body || {};
       if (food && typeof food === "string") {
