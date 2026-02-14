@@ -176,21 +176,17 @@ function extractPerMlFromDescription(desc) {
 }
 
 // ---- Extract pack-size grams from candidate name (generic) ----
-// Examples:
-// "French Fries Ready Salted (19.08g Bag)"
-// "Walkers Ready Salted Crisps (32.5g)"
-// "Chocolate Bar 51g"
 function extractPackSizeGramsFromName(name) {
   const t = String(name || "");
 
-  // Look for "(19.08g ...)" or "(32.5g)" patterns
+  // "(19.08g Bag)" / "(32.5g)"
   let m = t.match(/\((\d+(?:\.\d+)?)\s*g\b/i);
   if (m) {
     const g = Number(m[1]);
     return Number.isFinite(g) && g > 0 ? g : null;
   }
 
-  // Look for "51g" anywhere (but avoid catching "per 100g" which isn't in name usually)
+  // "51g" anywhere
   m = t.match(/\b(\d+(?:\.\d+)?)\s*g\b/i);
   if (m) {
     const g = Number(m[1]);
@@ -200,10 +196,8 @@ function extractPackSizeGramsFromName(name) {
   return null;
 }
 
-// Detect “composite” multi-item inputs (e.g. "2 eggs and toast with butter").
 function looksComposite(text) {
   const t = String(text || "").toLowerCase();
-
   if (t.includes(" and ") || t.includes(",") || t.includes(" + ")) return true;
 
   const qtyMatches = t.match(
@@ -228,7 +222,7 @@ function buildFatSecretCandidates(fsData) {
       description,
       per_grams: extractPerGramsFromDescription(description),
       per_ml: extractPerMlFromDescription(description),
-      pack_grams: extractPackSizeGramsFromName(name), // <-- NEW
+      pack_grams: extractPackSizeGramsFromName(name),
       type: f.food_type || null,
       url: f.food_url || null,
     };
@@ -293,9 +287,48 @@ function packSizeMismatch(userGrams, candidatePackGrams) {
   const p = Number(candidatePackGrams);
   if (u <= 0 || p <= 0) return false;
 
-  // Relative difference threshold: > 20% mismatch means likely wrong pack size
   const rel = Math.abs(p - u) / u;
-  return rel > 0.2;
+  return rel > 0.2; // >20% mismatch
+}
+
+function looksPerPackServing(desc) {
+  const d = normText(desc);
+  // high-signal serving terms (avoid overfitting)
+  return (
+    d.includes("per 1 pack") ||
+    d.includes("per 1 bag") ||
+    d.includes("per pack") ||
+    d.includes("per bag") ||
+    d.includes("per 1 bar") ||
+    d.includes("per bar") ||
+    d.includes("per 1 serving") ||
+    d.includes("per serving") ||
+    d.includes("per 1 mug") ||
+    d.includes("per mug")
+  );
+}
+
+/**
+ * NEW POLICY: "explicit grams requires scalable nutrition"
+ *
+ * If user explicitly typed grams, we should NOT accept a DB item that is "per pack/bag"
+ * unless we can safely scale (per_grams) OR the pack size matches.
+ *
+ * Otherwise: mismatch -> retry/fallback to AI.
+ */
+function cannotSafelyUseForExplicitGrams(candidate, explicitGrams) {
+  if (explicitGrams === null) return false;
+
+  // If we can scale by Per Ng, it's safe.
+  if (candidate?.per_grams) return false;
+
+  // If candidate has explicit pack grams and it's close, it's safe.
+  if (candidate?.pack_grams && !packSizeMismatch(explicitGrams, candidate.pack_grams)) return false;
+
+  // If candidate is per-pack/bag/serving style and we cannot scale/confirm pack grams -> unsafe.
+  if (looksPerPackServing(candidate?.description || "")) return true;
+
+  return false;
 }
 
 function computeMismatch(userText, chosenCandidate, { explicitGrams }) {
@@ -309,14 +342,17 @@ function computeMismatch(userText, chosenCandidate, { explicitGrams }) {
     mismatches.push("variant_mismatch_user_unspecified");
   }
 
-  // NEW: explicit grams vs pack size mismatch
-  // If user typed grams but candidate is a specific pack size that differs greatly, veto.
   if (
     explicitGrams !== null &&
     chosenCandidate?.pack_grams !== null &&
     packSizeMismatch(explicitGrams, chosenCandidate.pack_grams)
   ) {
     mismatches.push("explicit_weight_vs_pack_size_mismatch");
+  }
+
+  // NEW: explicit grams but per-pack entry cannot be safely scaled
+  if (cannotSafelyUseForExplicitGrams(chosenCandidate, explicitGrams)) {
+    mismatches.push("explicit_weight_requires_scalable_source");
   }
 
   return mismatches;
@@ -342,6 +378,11 @@ function filterCandidatesByMismatches(candidates, userText, mismatches, { explic
       ) {
         return false;
       }
+    }
+
+    if (mismatches.includes("explicit_weight_requires_scalable_source")) {
+      // Remove candidates that are unsafe for explicit grams
+      if (cannotSafelyUseForExplicitGrams(c, explicitGrams)) return false;
     }
 
     return true;
@@ -618,7 +659,8 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       return res.json(fallback);
     }
 
-    // 3) Generic mismatch guardrail: if mismatch, retry with filtered candidates ONCE
+    // 3) Generic mismatch guardrail: if mismatch, retry with filtered candidates ONCE,
+    // and if still no good DB candidate, fallback to AI (great UX)
     const mismatches = computeMismatch(food, chosen, { explicitGrams: grams });
     let didRetry = false;
 
@@ -642,6 +684,23 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           pick = retryPick;
           modelConfidence = retryConfidence;
           chosen = filtered[retryPick.chosen_index] || chosen;
+
+          // If even after retry the chosen candidate still fails "explicit grams must be scalable",
+          // go straight to AI fallback.
+          if (cannotSafelyUseForExplicitGrams(chosen, grams)) {
+            const fallback = await estimateWithGPT(food);
+            if (debug) {
+              fallback.debug = {
+                fallback_reason: "explicit_grams_requires_scalable_source_fallback",
+                mismatches: [...mismatches, "explicit_weight_requires_scalable_source"],
+                threshold: FATSECRET_MIN_CONFIDENCE,
+                candidate_count: candidates.length,
+                filtered_candidate_count: filtered.length,
+              };
+            }
+            cache.set(cacheKey, fallback);
+            return res.json(fallback);
+          }
         } else {
           const fallback = await estimateWithGPT(food);
           if (debug) {
