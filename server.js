@@ -32,6 +32,7 @@ app.use(
   })
 );
 
+
 // -------------------- Clients --------------------
 
 const openai = new OpenAI({
@@ -50,9 +51,10 @@ let accessToken = null;
 let tokenExpirationTime = 0;
 
 
-// -------------------- Token --------------------
+// -------------------- OAuth --------------------
 
 async function getAccessToken() {
+
   const res = await axios.post(
     "https://oauth.fatsecret.com/connect/token",
     new URLSearchParams({
@@ -70,65 +72,76 @@ async function getAccessToken() {
   );
 
   accessToken = res.data.access_token;
+
   tokenExpirationTime =
     Date.now() + res.data.expires_in * 1000;
 }
 
-async function ensureFatSecretToken(
-  req,
-  res,
-  next
-) {
+async function ensureFatSecretToken(req, res, next) {
+
   if (
     !accessToken ||
     Date.now() >= tokenExpirationTime
   ) {
     await getAccessToken();
   }
+
   next();
 }
 
 
-// -------------------- Helpers --------------------
+// -------------------- Extraction helpers --------------------
 
 function extractExplicitGrams(text) {
-  const m = String(text).match(
-    /(\d+(?:\.\d+)?)\s*g\b/i
-  );
+
+  const m =
+    String(text).match(/(\d+(?:\.\d+)?)\s*g\b/i);
+
   return m ? Number(m[1]) : null;
 }
 
 function extractExplicitMl(text) {
-  const m = String(text).match(
-    /(\d+(?:\.\d+)?)\s*ml\b/i
-  );
+
+  const m =
+    String(text).match(/(\d+(?:\.\d+)?)\s*ml\b/i);
+
   return m ? Number(m[1]) : null;
 }
 
 function extractPerGrams(desc) {
-  const m = String(desc).match(
-    /\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i
-  );
+
+  const m =
+    String(desc).match(
+      /\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i
+    );
+
   return m ? Number(m[1]) : null;
 }
 
 function extractPerMl(desc) {
-  const m = String(desc).match(
-    /\bPer\s+(\d+(?:\.\d+)?)\s*ml\b/i
-  );
+
+  const m =
+    String(desc).match(
+      /\bPer\s+(\d+(?:\.\d+)?)\s*ml\b/i
+    );
+
   return m ? Number(m[1]) : null;
 }
 
 function extractPerFlOz(desc) {
-  const m = String(desc).match(
-    /\bPer\s+(\d+(?:\.\d+)?)\s*fl\s*oz\b/i
-  );
+
+  const m =
+    String(desc).match(
+      /\bPer\s+(\d+(?:\.\d+)?)\s*fl\s*oz\b/i
+    );
+
   if (!m) return null;
 
   return Number(m[1]) * 29.5735;
 }
 
 function looksPerServingUnit(desc) {
+
   if (!desc) return false;
 
   if (/\bPer\s+1\s+[A-Za-z]/i.test(desc))
@@ -140,21 +153,24 @@ function looksPerServingUnit(desc) {
   return false;
 }
 
+
+// -------------------- Nutrition parser --------------------
+
 function parseNutrition(desc) {
+
   if (!desc) return null;
 
-  const cal = desc.match(
-    /Calories:\s*(\d+(?:\.\d+)?)/i
-  );
-  const fat = desc.match(
-    /Fat:\s*(\d+(?:\.\d+)?)/i
-  );
-  const carbs = desc.match(
-    /Carbs:\s*(\d+(?:\.\d+)?)/i
-  );
-  const protein = desc.match(
-    /Protein:\s*(\d+(?:\.\d+)?)/i
-  );
+  const cal =
+    desc.match(/Calories:\s*(\d+(?:\.\d+)?)/i);
+
+  const fat =
+    desc.match(/Fat:\s*(\d+(?:\.\d+)?)/i);
+
+  const carbs =
+    desc.match(/Carbs:\s*(\d+(?:\.\d+)?)/i);
+
+  const protein =
+    desc.match(/Protein:\s*(\d+(?:\.\d+)?)/i);
 
   if (!cal) return null;
 
@@ -162,9 +178,7 @@ function parseNutrition(desc) {
     calories: Number(cal[1]),
     fat: fat ? Number(fat[1]) : 0,
     carbs: carbs ? Number(carbs[1]) : 0,
-    protein: protein
-      ? Number(protein[1])
-      : 0,
+    protein: protein ? Number(protein[1]) : 0,
   };
 }
 
@@ -172,11 +186,13 @@ function parseNutrition(desc) {
 // -------------------- Candidate builder --------------------
 
 function buildCandidates(fsData) {
+
   const foods =
     fsData?.foods?.food || [];
 
   return foods
     .map((f) => {
+
       const desc =
         f.food_description || "";
 
@@ -193,7 +209,7 @@ function buildCandidates(fsData) {
       return {
         id: f.food_id,
         name: f.food_name,
-        brand: f.brand_name,
+        brand: f.brand_name || null,
         description: desc,
         nutrition,
         per_grams: perGrams,
@@ -206,11 +222,8 @@ function buildCandidates(fsData) {
 
 // -------------------- Scaling --------------------
 
-function scaleCandidate(
-  candidate,
-  grams,
-  ml
-) {
+function scaleCandidate(candidate, grams, ml) {
+
   const base =
     candidate.nutrition;
 
@@ -224,6 +237,7 @@ function scaleCandidate(
     factor =
       grams /
       candidate.per_grams;
+
     mode = "weight";
   }
 
@@ -234,41 +248,39 @@ function scaleCandidate(
     factor =
       ml /
       candidate.per_ml;
+
     mode = "volume";
   }
 
   return {
+
     mode,
-    calories: Math.round(
-      base.calories * factor
-    ),
-    protein: +(
-      base.protein * factor
-    ).toFixed(1),
-    carbs: +(
-      base.carbs * factor
-    ).toFixed(1),
-    fat: +(
-      base.fat * factor
-    ).toFixed(1),
-    factor,
+
+    calories:
+      Math.round(base.calories * factor),
+
+    protein:
+      +(base.protein * factor).toFixed(1),
+
+    carbs:
+      +(base.carbs * factor).toFixed(1),
+
+    fat:
+      +(base.fat * factor).toFixed(1),
+
+    factor
   };
 }
 
 
-// -------------------- Mismatch detection --------------------
+// -------------------- Mismatch detector --------------------
 
-function isMismatch(
-  candidate,
-  grams,
-  ml
-) {
+function isMismatch(candidate, grams, ml) {
+
   if (
     grams &&
     !candidate.per_grams &&
-    looksPerServingUnit(
-      candidate.description
-    )
+    looksPerServingUnit(candidate.description)
   ) {
     return true;
   }
@@ -276,9 +288,7 @@ function isMismatch(
   if (
     ml &&
     !candidate.per_ml &&
-    looksPerServingUnit(
-      candidate.description
-    )
+    looksPerServingUnit(candidate.description)
   ) {
     return true;
   }
@@ -287,92 +297,118 @@ function isMismatch(
 }
 
 
-// -------------------- AI fallback --------------------
+// -------------------- AI candidate selector --------------------
 
-async function aiFallback(
-  food,
-  grams,
-  ml
-) {
+async function pickBestCandidateIndex(userFood, candidates) {
+
+  if (!candidates.length) return -1;
+
+  const simplified =
+    candidates.map((c, i) => ({
+      index: i,
+      name: c.name,
+      brand: c.brand,
+      description: c.description
+    }));
+
   const response =
     await openai.responses.create({
+
       model: "gpt-4.1-mini",
-      temperature: 0.2,
+
+      temperature: 0,
+
       text: {
         format: {
-          type: "json_object",
-        },
+          type: "json_object"
+        }
       },
+
       input: [
+
         {
           role: "system",
           content:
-            "Return nutrition estimate JSON.",
+            "Select best matching food.\n" +
+            "Return JSON: {\"index\": number, \"confidence\": number}\n" +
+            "Never choose unrelated foods."
         },
+
         {
           role: "user",
-          content: food,
-        },
-      ],
+          content: JSON.stringify({
+            query: userFood,
+            candidates: simplified
+          })
+        }
+      ]
     });
 
-  const data =
-    JSON.parse(
-      response.output_text
-    );
+  try {
 
-  if (grams) {
-    const factor =
-      grams / 100;
+    const result =
+      JSON.parse(response.output_text);
 
-    return {
-      source: "ai",
-      mode: "weight",
-      name: data.name,
-      grams,
-      calories: Math.round(
-        data.calories_per_100g *
-        factor
-      ),
-      protein: +(
-        data.protein_per_100g *
-        factor
-      ).toFixed(1),
-      carbs: +(
-        data.carbs_per_100g *
-        factor
-      ).toFixed(1),
-      fat: +(
-        data.fat_per_100g *
-        factor
-      ).toFixed(1),
-      confidence:
-        data.confidence ||
-        0.9,
-    };
-  }
+    if (
+      typeof result.index === "number" &&
+      result.index >= 0 &&
+      result.index < candidates.length
+    ) {
+      return result.index;
+    }
+
+  } catch {}
+
+  return -1;
+}
+
+
+// -------------------- AI fallback --------------------
+
+async function aiFallback(food, grams, ml) {
+
+  const response =
+    await openai.responses.create({
+
+      model: "gpt-4.1-mini",
+
+      temperature: 0.2,
+
+      text: {
+        format: {
+          type: "json_object"
+        }
+      },
+
+      input: [
+        {
+          role: "user",
+          content: food
+        }
+      ]
+    });
 
   return {
     source: "ai",
-    ...data,
+    ...JSON.parse(response.output_text)
   };
 }
 
 
-// -------------------- Hybrid resolve --------------------
+// -------------------- Hybrid resolve endpoint --------------------
 
 app.post(
   "/food/resolve",
   ensureFatSecretToken,
   async (req, res) => {
+
     try {
+
       const { food, debug } =
         req.body;
 
       const grams =
-        extractExplicitGrams(
-          food
-        );
+        extractExplicitGrams(food);
 
       const ml =
         extractExplicitMl(food);
@@ -382,77 +418,75 @@ app.post(
           FATSECRET_API_URL,
           {
             params: {
-              method:
-                "foods.search",
-              search_expression:
-                food,
+              method: "foods.search",
+              search_expression: food,
               max_results: 12,
-              format: "json",
+              format: "json"
             },
             headers: {
               Authorization:
-                `Bearer ${accessToken}`,
-            },
+                `Bearer ${accessToken}`
+            }
           }
         );
 
       const candidates =
-        buildCandidates(
-          fsRes.data
+        buildCandidates(fsRes.data);
+
+      const bestIndex =
+        await pickBestCandidateIndex(
+          food,
+          candidates
         );
 
-      for (const candidate of candidates) {
+      if (bestIndex >= 0) {
+
+        const candidate =
+          candidates[bestIndex];
+
         if (
-          isMismatch(
-            candidate,
-            grams,
-            ml
-          )
-        )
-          continue;
+          !isMismatch(candidate, grams, ml)
+        ) {
 
-        const scaled =
-          scaleCandidate(
-            candidate,
-            grams,
-            ml
-          );
+          const scaled =
+            scaleCandidate(
+              candidate,
+              grams,
+              ml
+            );
 
-        return res.json({
-          source:
-            "fatsecret",
-          name:
-            candidate.name,
-          grams,
-          ml,
-          ...scaled,
-          confidence: 0.9,
-          debug:
-            debug && {
-              candidate:
-                candidate.name,
-              factor:
-                scaled.factor,
-            },
-        });
+          return res.json({
+            source: "fatsecret",
+            name: candidate.name,
+            grams,
+            ml,
+            ...scaled,
+            confidence: 0.9,
+            debug: debug && {
+              candidate: candidate.name,
+              index: bestIndex,
+              factor: scaled.factor
+            }
+          });
+        }
       }
 
       const fallback =
-        await aiFallback(
-          food,
-          grams,
-          ml
-        );
+        await aiFallback(food, grams, ml);
 
-      res.json(fallback);
-    } catch (err) {
+      return res.json({
+        ...fallback,
+        debug: debug && { fallback: true }
+      });
+
+    }
+    catch (err) {
+
       console.error(err);
-      res
-        .status(500)
-        .json({
-          error:
-            "resolve failed",
-        });
+
+      res.status(500).json({
+        error: "resolve failed"
+      });
     }
   }
 );
@@ -460,18 +494,15 @@ app.post(
 
 // -------------------- Health --------------------
 
-app.get(
-  "/health",
-  (req, res) =>
-    res.send("OK")
+app.get("/health", (req, res) =>
+  res.send("OK")
 );
 
 
-// -------------------- Start --------------------
+// -------------------- Start server --------------------
 
 const PORT =
-  process.env.PORT ||
-  3000;
+  process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(
