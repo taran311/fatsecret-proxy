@@ -113,6 +113,18 @@ function clamp01(n, fallback = 0.7) {
   return Math.max(0, Math.min(1, x));
 }
 
+function normText(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function includesAny(haystack, needles) {
+  const h = normText(haystack);
+  return needles.some((n) => h.includes(n));
+}
+
 // ---- Explicit quantity parsing from user input ----
 
 // Only triggers if the user explicitly typed g/gram/grams
@@ -147,10 +159,6 @@ function extractExplicitMl(foodText) {
 }
 
 // ---- Extract scaling bases from FatSecret descriptions ----
-// Examples:
-// "Per 100g - ..."
-// "Per 1152g - ..."
-// "Per 100ml - ..."
 function extractPerGramsFromDescription(desc) {
   if (!desc) return null;
   const m = String(desc).match(/\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i);
@@ -168,14 +176,11 @@ function extractPerMlFromDescription(desc) {
 }
 
 // Detect “composite” multi-item inputs (e.g. "2 eggs and toast with butter").
-// For composites, it's better UX to go straight to AI rather than forcing a single DB match.
 function looksComposite(text) {
   const t = String(text || "").toLowerCase();
 
-  // common separators indicating multiple foods
   if (t.includes(" and ") || t.includes(",") || t.includes(" + ")) return true;
 
-  // If it has 2+ explicit quantity patterns, treat as composite
   const qtyMatches = t.match(
     /\b\d+(\.\d+)?\s*(x\s*)?(slice|slices|egg|eggs|tbsp|tsp|cup|cups|bar|bars|piece|pieces|portion|portions)\b/g
   );
@@ -200,6 +205,104 @@ function buildFatSecretCandidates(fsData) {
       type: f.food_type || null,
       url: f.food_url || null,
     };
+  });
+}
+
+// -------------------- Generic mismatch guardrails --------------------
+//
+// Goal: avoid “product-type mismatches” without whack-a-mole per-item hacks.
+// We detect user intent *signals* and candidate *signals* and veto mismatches.
+//
+// Examples covered:
+// - Coffee shop drink size ("medium latte") vs at-home pods/capsules (Tassimo/Nespresso/etc.)
+// - Variant mismatch: user didn’t say "baked/zero/diet/light" but candidate is that variant
+//
+const TOKENS = {
+  // user size intent for drinks (in-store)
+  drinkSizes: ["small", "medium", "large", "grande", "venti", "tall"],
+
+  // capsule / at-home coffee products
+  capsule: [
+    "tassimo",
+    "nespresso",
+    "dolce gusto",
+    "dolcegusto",
+    "k-cup",
+    "kcup",
+    "keurig",
+    "pod",
+    "pods",
+    "capsule",
+    "capsules",
+  ],
+
+  // variant tokens that frequently cause wrong selection when user didn’t ask for them
+  // (keep this short and high-signal)
+  variants: [
+    "baked",
+    "light",
+    "lite",
+    "zero",
+    "diet",
+    "sugar free",
+    "sugar-free",
+    "low fat",
+    "reduced fat",
+    "fat free",
+  ],
+};
+
+function candidateText(c) {
+  return `${c?.brand || ""} ${c?.name || ""} ${c?.description || ""}`;
+}
+
+function userImpliesInStoreDrink(userText) {
+  const u = normText(userText);
+  // size words are the strongest signal; also “latte/cappuccino/flat white” with a size is common
+  return includesAny(u, TOKENS.drinkSizes);
+}
+
+function candidateLooksCapsuleProduct(c) {
+  return includesAny(candidateText(c), TOKENS.capsule);
+}
+
+function userAsksForVariant(userText) {
+  return includesAny(userText, TOKENS.variants);
+}
+
+function candidateIsVariant(c) {
+  return includesAny(candidateText(c), TOKENS.variants);
+}
+
+function computeMismatch(userText, chosenCandidate) {
+  const mismatches = [];
+
+  // Coffee shop size query should not map to capsule products.
+  if (userImpliesInStoreDrink(userText) && candidateLooksCapsuleProduct(chosenCandidate)) {
+    mismatches.push("coffee_shop_size_vs_capsule_product");
+  }
+
+  // If user didn’t ask for variant, avoid variant products (baked/zero/light/etc.).
+  if (!userAsksForVariant(userText) && candidateIsVariant(chosenCandidate)) {
+    mismatches.push("variant_mismatch_user_unspecified");
+  }
+
+  return mismatches;
+}
+
+function filterCandidatesByMismatches(candidates, userText, mismatches) {
+  if (!mismatches.length) return candidates;
+
+  return candidates.filter((c) => {
+    // Remove capsule-like candidates if mismatch type says so.
+    if (mismatches.includes("coffee_shop_size_vs_capsule_product")) {
+      if (candidateLooksCapsuleProduct(c)) return false;
+    }
+    // Remove variant candidates if mismatch type says so.
+    if (mismatches.includes("variant_mismatch_user_unspecified")) {
+      if (candidateIsVariant(c)) return false;
+    }
+    return true;
   });
 }
 
@@ -262,7 +365,6 @@ Return JSON:
     };
   }
 
-  // Composite-friendly serving estimator
   const response = await openai.responses.create({
     model: "gpt-4.1-mini",
     temperature: 0.2,
@@ -313,6 +415,65 @@ Return JSON:
     fat: Number((Number(out.fat) || 0).toFixed(1)),
     confidence: clamp01(out.confidence, 0.7),
   };
+}
+
+// -------------------- AI selector (wrapped so we can retry with filtered candidates) --------------------
+async function selectFromCandidates({ food, grams, ml, candidates }) {
+  const selector = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    temperature: 0.1,
+    text: { format: { type: "json_object" } },
+    input: [
+      {
+        role: "system",
+        content:
+          "Return ONLY valid JSON.\n\n" +
+          "Task:\n" +
+          "- Choose the SINGLE best FatSecret candidate for the user's input.\n" +
+          "- Use brand/name/description to match.\n" +
+          "- If none are suitable, set use_fallback=true.\n\n" +
+          "Candidate fields:\n" +
+          "- candidate.per_grams is present if description contains 'Per {N}g'.\n" +
+          "- candidate.per_ml is present if description contains 'Per {N}ml'.\n\n" +
+          "SCALING RULES:\n" +
+          "- If user provided grams AND candidate.per_grams is present, scale by factor = grams / per_grams and set mode='weight'.\n" +
+          "- If user provided ml AND candidate.per_ml is present, scale by factor = ml / per_ml and set mode='volume'.\n" +
+          "- If description is per serving/bar/slice/pack/mug (no per_grams/per_ml), DO NOT scale; set mode='serving'.\n\n" +
+          "Fallback rule:\n" +
+          "- If you cannot reliably extract calories and at least 2 macros from description, set use_fallback=true.\n\n" +
+          "Output must match the schema exactly. confidence is 0..1.",
+      },
+      {
+        role: "user",
+        content: JSON.stringify(
+          {
+            user_input: food,
+            explicit_grams: grams,
+            explicit_ml: ml,
+            candidates,
+            schema: {
+              use_fallback: "boolean",
+              chosen_index: "number | null",
+              name: "string",
+              mode: '"weight" | "volume" | "serving"',
+              grams: "number | null",
+              ml: "number | null",
+              calories: "number",
+              protein: "number",
+              carbs: "number",
+              fat: "number",
+              confidence: "number",
+              reason: "string",
+            },
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  });
+
+  return safeJsonParse(selector.output_text);
 }
 
 // -------------------- SINGLE ENDPOINT: Hybrid resolve --------------------
@@ -368,82 +529,24 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
 
     const candidates = buildFatSecretCandidates(fsData);
 
-    // If no candidates -> AI fallback
     if (!candidates.length) {
       const fallback = await estimateWithGPT(food);
       cache.set(cacheKey, fallback);
       return res.json(fallback);
     }
 
-    // 2) AI selection layer (now supports Per {N}g and Per {N}ml)
-    const selector = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      temperature: 0.1,
-      text: { format: { type: "json_object" } },
-      input: [
-        {
-          role: "system",
-          content:
-            "Return ONLY valid JSON.\n\n" +
-            "Task:\n" +
-            "- Choose the SINGLE best FatSecret candidate for the user's input.\n" +
-            "- Use brand/name/description to match.\n" +
-            "- If none are suitable, set use_fallback=true.\n\n" +
-            "IMPORTANT disambiguation rules:\n" +
-            "- If the user query implies a coffee shop drink size (small/medium/large) like 'Costa latte medium', prefer in-store drink entries.\n" +
-            "- Avoid at-home pod/capsule products (Tassimo, Nespresso, Dolce Gusto, K-Cup, pods/capsules) UNLESS the user explicitly mentions them.\n" +
-            "- Avoid 'baked', 'diet', 'zero', 'light', 'low fat' variants unless the user explicitly mentioned those words.\n\n" +
-            "Candidate fields:\n" +
-            "- candidate.per_grams is present if description contains 'Per {N}g'.\n" +
-            "- candidate.per_ml is present if description contains 'Per {N}ml'.\n\n" +
-            "SCALING RULES (IMPORTANT):\n" +
-            "- If user provided explicit grams AND candidate.per_grams is present, scale by factor = grams / per_grams and set mode='weight'.\n" +
-            "- If user provided explicit ml AND candidate.per_ml is present, scale by factor = ml / per_ml and set mode='volume'.\n" +
-            "- If description is per serving/bar/slice/pack/mug (no per_grams/per_ml), DO NOT scale; set mode='serving'.\n\n" +
-            "Fallback rule:\n" +
-            "- If you cannot reliably extract calories and at least 2 macros from description, set use_fallback=true.\n\n" +
-            "Output must match the schema exactly. confidence is 0..1.",
-        },
-        {
-          role: "user",
-          content: JSON.stringify(
-            {
-              user_input: food,
-              explicit_grams: grams,
-              explicit_ml: ml,
-              candidates,
-              schema: {
-                use_fallback: "boolean",
-                chosen_index: "number | null",
-                name: "string",
-                mode: '"weight" | "volume" | "serving"',
-                grams: "number | null",
-                ml: "number | null",
-                calories: "number",
-                protein: "number",
-                carbs: "number",
-                fat: "number",
-                confidence: "number",
-                reason: "string",
-              },
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    });
+    // 2) Select best candidate with AI
+    let pick = await selectFromCandidates({ food, grams, ml, candidates });
+    let modelConfidence = clamp01(pick?.confidence, 0);
 
-    const pick = safeJsonParse(selector.output_text);
-    const modelConfidence = clamp01(pick?.confidence, 0);
-
-    // Minimum confidence threshold fallback
-    if (
+    // Early fallback if pick is bad
+    const shouldFallbackInitial =
       !pick ||
       pick.use_fallback ||
       pick.chosen_index === null ||
-      modelConfidence < FATSECRET_MIN_CONFIDENCE
-    ) {
+      modelConfidence < FATSECRET_MIN_CONFIDENCE;
+
+    if (shouldFallbackInitial) {
       const fallback = await estimateWithGPT(food);
 
       if (debug) {
@@ -466,11 +569,65 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       return res.json(fallback);
     }
 
-    const chosen = candidates[pick.chosen_index];
+    // Validate chosen candidate exists
+    let chosen = candidates[pick.chosen_index];
     if (!chosen) {
       const fallback = await estimateWithGPT(food);
       cache.set(cacheKey, fallback);
       return res.json(fallback);
+    }
+
+    // 3) Generic mismatch guardrail: if mismatch, retry with filtered candidates ONCE
+    const mismatches = computeMismatch(food, chosen);
+    let didRetry = false;
+
+    if (mismatches.length) {
+      const filtered = filterCandidatesByMismatches(candidates, food, mismatches);
+      if (filtered.length && filtered.length !== candidates.length) {
+        didRetry = true;
+        const retryPick = await selectFromCandidates({ food, grams, ml, candidates: filtered });
+        const retryConfidence = clamp01(retryPick?.confidence, 0);
+
+        if (
+          retryPick &&
+          !retryPick.use_fallback &&
+          retryPick.chosen_index !== null &&
+          retryConfidence >= FATSECRET_MIN_CONFIDENCE
+        ) {
+          pick = retryPick;
+          modelConfidence = retryConfidence;
+          chosen = filtered[retryPick.chosen_index] || chosen;
+        } else {
+          // Retry failed → fallback to AI (better than wrong product-type)
+          const fallback = await estimateWithGPT(food);
+          if (debug) {
+            fallback.debug = {
+              fallback_reason: "mismatch_veto_then_retry_failed",
+              mismatches,
+              model_confidence: modelConfidence,
+              threshold: FATSECRET_MIN_CONFIDENCE,
+              candidate_count: candidates.length,
+              filtered_candidate_count: filtered.length,
+            };
+          }
+          cache.set(cacheKey, fallback);
+          return res.json(fallback);
+        }
+      } else {
+        // Nothing to filter, so safest is fallback
+        const fallback = await estimateWithGPT(food);
+        if (debug) {
+          fallback.debug = {
+            fallback_reason: "mismatch_veto_no_filter_possible",
+            mismatches,
+            model_confidence: modelConfidence,
+            threshold: FATSECRET_MIN_CONFIDENCE,
+            candidate_count: candidates.length,
+          };
+        }
+        cache.set(cacheKey, fallback);
+        return res.json(fallback);
+      }
     }
 
     const result = {
@@ -500,6 +657,8 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
         threshold: FATSECRET_MIN_CONFIDENCE,
         explicit_grams: grams,
         explicit_ml: ml,
+        mismatches_detected: mismatches,
+        mismatch_retry_performed: didRetry,
       };
     }
 
@@ -596,7 +755,6 @@ app.post("/macro-targets", async (req, res) => {
       return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
     }
 
-    // ---- Baseline calculation (code) ----
     const bmr = Math.round(bmrMifflin({ gender, weightKg, heightCm, age: ageNum }));
     const tdee = Math.round(bmr * activityFactor(exercise_level));
 
@@ -636,7 +794,6 @@ app.post("/macro-targets", async (req, res) => {
       },
     };
 
-    // ---- AI verification ----
     const aiResponse = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0,
