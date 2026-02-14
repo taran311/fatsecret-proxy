@@ -402,8 +402,9 @@ function isStrongGenericFallbackAllowed(query, candidate, token_score, grams, ml
 // -------------------- AI: estimate --------------------
 async function estimateAI(food) {
   const grams = extractExplicitGrams(food);
-  const ml = extractExplicitMl(food);
+  const explicitMl = extractExplicitMl(food);
 
+  // Weight-based: return per-100g, then scale in code
   if (grams) {
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
@@ -453,6 +454,7 @@ Return JSON:
     };
   }
 
+  // Serving/volume-based
   const response = await openai.responses.create({
     model: "gpt-4.1-mini",
     temperature: 0.05,
@@ -461,7 +463,16 @@ Return JSON:
       {
         role: "system",
         content:
-          "Return ONLY valid JSON. If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup, 330ml), estimate nutrition for that portion. If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
+          "Return ONLY valid JSON.\n\n" +
+          "If the food is a DRINK and volume is specified or implied (ml, l, oz, cup, bottle, can, medium, large, etc), populate:\n" +
+          "- ml: number\n" +
+          "- estimated_serving_grams: null\n\n" +
+          "If the food is SOLID and weight is specified or implied, populate:\n" +
+          "- estimated_serving_grams: number\n" +
+          "- ml: null\n\n" +
+          "If neither is specified, estimate a realistic UK serving and use grams for solids and ml for drinks.\n\n" +
+          "Never assign grams to drinks when ml is appropriate.\n\n" +
+          "Return realistic UK nutrition estimates.",
       },
       {
         role: "user",
@@ -471,7 +482,8 @@ Return JSON:
 {
   "name": string,
   "serving_description": string,
-  "estimated_serving_grams": number,
+  "estimated_serving_grams": number | null,
+  "ml": number | null,
   "calories": number,
   "protein": number,
   "carbs": number,
@@ -483,6 +495,9 @@ Return JSON:
   });
 
   const j = JSON.parse(response.output_text);
+
+  // Prefer explicit ml from input if model left it blank
+  const ml = Number.isFinite(Number(j.ml)) ? Number(j.ml) : explicitMl;
 
   return {
     source: "ai",
