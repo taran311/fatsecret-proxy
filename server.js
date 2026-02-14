@@ -4,7 +4,6 @@ import axios from "axios";
 import bodyParser from "body-parser";
 import cors from "cors";
 import compression from "compression";
-import NodeCache from "node-cache";
 import OpenAI from "openai";
 
 dotenv.config();
@@ -14,30 +13,11 @@ const app = express();
 app.use(bodyParser.json());
 app.use(compression());
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
+app.use(cors({
+  origin: true
+}));
 
-      if (
-        origin === "https://thecaloriecard.com" ||
-        origin.startsWith("http://localhost") ||
-        origin.startsWith("http://127.0.0.1")
-      ) {
-        return callback(null, true);
-      }
-
-      return callback(new Error("Not allowed by CORS"));
-    },
-  })
-);
-
-
-// -------------------- Clients --------------------
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// -------------------- CONFIG --------------------
 
 const FATSECRET_API_URL =
   "https://platform.fatsecret.com/rest/server.api";
@@ -45,13 +25,15 @@ const FATSECRET_API_URL =
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-const cache = new NodeCache({ stdTTL: 300 });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 let accessToken = null;
 let tokenExpirationTime = 0;
 
 
-// -------------------- OAuth --------------------
+// -------------------- TOKEN --------------------
 
 async function getAccessToken() {
 
@@ -66,8 +48,8 @@ async function getAccessToken() {
     {
       headers: {
         "Content-Type":
-          "application/x-www-form-urlencoded",
-      },
+          "application/x-www-form-urlencoded"
+      }
     }
   );
 
@@ -77,20 +59,33 @@ async function getAccessToken() {
     Date.now() + res.data.expires_in * 1000;
 }
 
+
 async function ensureFatSecretToken(req, res, next) {
 
-  if (
-    !accessToken ||
-    Date.now() >= tokenExpirationTime
-  ) {
-    await getAccessToken();
-  }
+  try {
 
-  next();
+    if (
+      !accessToken ||
+      Date.now() >= tokenExpirationTime
+    ) {
+      await getAccessToken();
+    }
+
+    next();
+
+  }
+  catch (err) {
+
+    console.error("Token error:", err.message);
+
+    res.status(500).json({
+      error: "token failed"
+    });
+  }
 }
 
 
-// -------------------- Extraction helpers --------------------
+// -------------------- HELPERS --------------------
 
 function extractExplicitGrams(text) {
 
@@ -154,8 +149,6 @@ function looksPerServingUnit(desc) {
 }
 
 
-// -------------------- Nutrition parser --------------------
-
 function parseNutrition(desc) {
 
   if (!desc) return null;
@@ -178,12 +171,12 @@ function parseNutrition(desc) {
     calories: Number(cal[1]),
     fat: fat ? Number(fat[1]) : 0,
     carbs: carbs ? Number(carbs[1]) : 0,
-    protein: protein ? Number(protein[1]) : 0,
+    protein: protein ? Number(protein[1]) : 0
   };
 }
 
 
-// -------------------- Candidate builder --------------------
+// -------------------- BUILD CANDIDATES --------------------
 
 function buildCandidates(fsData) {
 
@@ -191,36 +184,27 @@ function buildCandidates(fsData) {
     fsData?.foods?.food || [];
 
   return foods
-    .map((f) => {
+    .map(f => {
 
       const desc =
         f.food_description || "";
 
-      const perGrams =
-        extractPerGrams(desc);
-
-      const perMl =
-        extractPerMl(desc) ??
-        extractPerFlOz(desc);
-
-      const nutrition =
-        parseNutrition(desc);
-
       return {
-        id: f.food_id,
         name: f.food_name,
         brand: f.brand_name || null,
         description: desc,
-        nutrition,
-        per_grams: perGrams,
-        per_ml: perMl,
+        nutrition: parseNutrition(desc),
+        per_grams: extractPerGrams(desc),
+        per_ml:
+          extractPerMl(desc) ??
+          extractPerFlOz(desc)
       };
     })
-    .filter((c) => c.nutrition);
+    .filter(c => c.nutrition);
 }
 
 
-// -------------------- Scaling --------------------
+// -------------------- SCALE --------------------
 
 function scaleCandidate(candidate, grams, ml) {
 
@@ -253,27 +237,21 @@ function scaleCandidate(candidate, grams, ml) {
   }
 
   return {
-
     mode,
-
     calories:
       Math.round(base.calories * factor),
-
     protein:
       +(base.protein * factor).toFixed(1),
-
     carbs:
       +(base.carbs * factor).toFixed(1),
-
     fat:
       +(base.fat * factor).toFixed(1),
-
     factor
   };
 }
 
 
-// -------------------- Mismatch detector --------------------
+// -------------------- MISMATCH --------------------
 
 function isMismatch(candidate, grams, ml) {
 
@@ -281,93 +259,78 @@ function isMismatch(candidate, grams, ml) {
     grams &&
     !candidate.per_grams &&
     looksPerServingUnit(candidate.description)
-  ) {
-    return true;
-  }
+  ) return true;
 
   if (
     ml &&
     !candidate.per_ml &&
     looksPerServingUnit(candidate.description)
-  ) {
-    return true;
-  }
+  ) return true;
 
   return false;
 }
 
 
-// -------------------- AI candidate selector --------------------
+// -------------------- AI SELECT --------------------
 
-async function pickBestCandidateIndex(userFood, candidates) {
-
-  if (!candidates.length) return -1;
-
-  const simplified =
-    candidates.map((c, i) => ({
-      index: i,
-      name: c.name,
-      brand: c.brand,
-      description: c.description
-    }));
-
-  const response =
-    await openai.responses.create({
-
-      model: "gpt-4.1-mini",
-
-      temperature: 0,
-
-      text: {
-        format: {
-          type: "json_object"
-        }
-      },
-
-      input: [
-
-        {
-          role: "system",
-          content:
-            "Select best matching food.\n" +
-            "Return JSON: {\"index\": number, \"confidence\": number}\n" +
-            "Never choose unrelated foods."
-        },
-
-        {
-          role: "user",
-          content: JSON.stringify({
-            query: userFood,
-            candidates: simplified
-          })
-        }
-      ]
-    });
+async function pickBestCandidateIndex(food, candidates) {
 
   try {
 
-    const result =
-      JSON.parse(response.output_text);
+    const simplified =
+      candidates.map((c, i) => ({
+        index: i,
+        name: c.name,
+        brand: c.brand
+      }));
+
+    const res =
+      await openai.responses.create({
+
+        model: "gpt-4.1-mini",
+
+        temperature: 0,
+
+        text: {
+          format: {
+            type: "json_object"
+          }
+        },
+
+        input: [
+          {
+            role: "user",
+            content: JSON.stringify({
+              query: food,
+              candidates: simplified
+            })
+          }
+        ]
+      });
+
+    const parsed =
+      JSON.parse(res.output_text);
 
     if (
-      typeof result.index === "number" &&
-      result.index >= 0 &&
-      result.index < candidates.length
+      typeof parsed.index === "number" &&
+      parsed.index >= 0 &&
+      parsed.index < candidates.length
     ) {
-      return result.index;
+      return parsed.index;
     }
 
-  } catch {}
+  }
+  catch {}
 
   return -1;
 }
 
 
-// -------------------- AI fallback --------------------
+// -------------------- AI FALLBACK --------------------
 
-async function aiFallback(food, grams, ml) {
+async function aiFallback(food) {
 
-  const response =
+  const res =
     await openai.responses.create({
 
       model: "gpt-4.1-mini",
@@ -390,12 +353,12 @@ async function aiFallback(food, grams, ml) {
 
   return {
     source: "ai",
-    ...JSON.parse(response.output_text)
+    ...JSON.parse(res.output_text)
   };
 }
 
 
-// -------------------- Hybrid resolve endpoint --------------------
+// -------------------- RESOLVE --------------------
 
 app.post(
   "/food/resolve",
@@ -433,56 +396,64 @@ app.post(
       const candidates =
         buildCandidates(fsRes.data);
 
-      const bestIndex =
+      if (!candidates.length)
+        return res.json(
+          await aiFallback(food)
+        );
+
+      let index =
         await pickBestCandidateIndex(
           food,
           candidates
         );
 
-      if (bestIndex >= 0) {
+      let candidate =
+        candidates[index] ||
+        candidates[0];
 
-        const candidate =
-          candidates[bestIndex];
-
-        if (
-          !isMismatch(candidate, grams, ml)
-        ) {
-
-          const scaled =
-            scaleCandidate(
-              candidate,
-              grams,
-              ml
-            );
-
-          return res.json({
-            source: "fatsecret",
-            name: candidate.name,
-            grams,
-            ml,
-            ...scaled,
-            confidence: 0.9,
-            debug: debug && {
-              candidate: candidate.name,
-              index: bestIndex,
-              factor: scaled.factor
-            }
-          });
-        }
+      if (
+        isMismatch(
+          candidate,
+          grams,
+          ml
+        )
+      ) {
+        return res.json(
+          await aiFallback(food)
+        );
       }
 
-      const fallback =
-        await aiFallback(food, grams, ml);
+      const scaled =
+        scaleCandidate(
+          candidate,
+          grams,
+          ml
+        );
 
       return res.json({
-        ...fallback,
-        debug: debug && { fallback: true }
+        source: "fatsecret",
+        name: candidate.name,
+        grams,
+        ml,
+        ...scaled,
+        confidence: 0.9,
+        debug:
+          debug && {
+            candidate:
+              candidate.name,
+            index,
+            factor:
+              scaled.factor
+          }
       });
 
     }
     catch (err) {
 
-      console.error(err);
+      console.error(
+        "Resolve error:",
+        err.message
+      );
 
       res.status(500).json({
         error: "resolve failed"
@@ -492,21 +463,12 @@ app.post(
 );
 
 
-// -------------------- Health --------------------
+// -------------------- START --------------------
 
-app.get("/health", (req, res) =>
-  res.send("OK")
+app.listen(
+  process.env.PORT || 3000,
+  () =>
+    console.log(
+      "Server running"
+    )
 );
-
-
-// -------------------- Start server --------------------
-
-const PORT =
-  process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(
-    "Server running on port",
-    PORT
-  );
-});
