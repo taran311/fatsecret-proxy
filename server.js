@@ -89,9 +89,8 @@ app.get("/health", (req, res) => res.status(200).send("OK"));
 // -------------------- FatSecret passthrough (optional) --------------------
 app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
   const { search_expression, max_results, format } = req.query;
-  const cacheKey = `fs:${search_expression}:${max_results || 12}:${
-    format || "json"
-  }`;
+  const cacheKey = `fs:${search_expression}:${max_results || 12}:${format || "json"
+    }`;
 
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
@@ -120,7 +119,7 @@ app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
   }
 });
 
-// -------------------- Config thresholds (tune later) --------------------
+// -------------------- Config thresholds --------------------
 const MIN_AI_CONFIDENCE = 0.65; // if AI confidence below this, DB upgrade is allowed with weaker DB-pick confidence
 const MIN_DB_TOKEN_SCORE = 0.35; // DB must “look like” the query
 const MIN_DB_AI_PICK_CONF = 0.6; // AI must be reasonably confident choosing a DB candidate (unless AI estimate is low-confidence)
@@ -158,7 +157,7 @@ function extractBrandHints(query) {
   const q = normText(query);
   const hints = [];
 
-  // Keep this list small; it’s just to avoid obvious brand mismatches.
+  // Keep small; just to prevent obvious brand mismatches.
   const known = [
     "greggs",
     "walkers",
@@ -190,6 +189,46 @@ function stripBrandHintsFromQuery(query, brandHints) {
     q = q.replaceAll(` ${bb} `, " ");
   }
   return q.replace(/\s+/g, " ").trim();
+}
+
+// ✅ NEW: single “cleaned query” used for one (and only one) retry
+function cleanQueryForFatSecret(query, brandHints) {
+  let q = normText(query);
+
+  // remove known brand hints
+  q = stripBrandHintsFromQuery(q, brandHints);
+
+  // remove explicit quantities like 400g, 330ml, 2l, etc.
+  q = q.replace(/\b\d+(?:\.\d+)?\s*(g|gram|grams|ml|l)\b/g, " ");
+
+  // remove size tokens that often hurt recall for drinks/ready meals
+  q = q.replace(
+    /\b(small|medium|large|grande|venti|tall|regular|king|mini)\b/g,
+    " "
+  );
+
+  // collapse spaces
+  q = q.replace(/\s+/g, " ").trim();
+  return q;
+}
+
+// ✅ NEW: coffee-shop intent + capsule/pod veto (prevents Tassimo/Pods overriding shop drinks)
+function hasCoffeeShopIntent(query) {
+  const q = normText(query);
+  const sizeSignals =
+    /\b(small|medium|large|grande|venti|tall)\b/.test(q) ||
+    /\b(costa|starbucks|caffe|café|coffee shop)\b/.test(q);
+  const drinkSignals = /\b(latte|cappuccino|flat white|americano|mocha)\b/.test(q);
+  return sizeSignals && drinkSignals;
+}
+
+function isCapsuleOrInstantDrinkCandidate(candidateText) {
+  const t = normText(candidateText);
+  // Generic “format mismatch” keywords (not millions of nitpicks)
+  return (
+    /\b(tassimo|nespresso|dolce|gusto|keurig|pod|pods|capsule|capsules)\b/.test(t) ||
+    /\b(instant|powder|sachet|mug)\b/.test(t)
+  );
 }
 
 // -------------------- Quantity extractors --------------------
@@ -350,7 +389,10 @@ function scaleCandidate(candidate, grams, ml) {
 function isScalingMismatch(candidate, grams, ml, query) {
   if (grams && !candidate.per_grams && looksPerServingUnit(candidate.description)) {
     // snack-pack exception: allow "Per 1 pack/bag" when query looks like a snack pack
-    if (looksLikeSnackPackQuery(query, grams) && isBagOrPackServing(candidate.description)) {
+    if (
+      looksLikeSnackPackQuery(query, grams) &&
+      isBagOrPackServing(candidate.description)
+    ) {
       return false;
     }
     return true;
@@ -374,7 +416,7 @@ function isStrongGenericFallbackAllowed(query, candidate, token_score, grams, ml
   return true;
 }
 
-// -------------------- AI: estimate (single brain for resolve) --------------------
+// -------------------- AI: estimate --------------------
 async function estimateAI(food) {
   const grams = extractExplicitGrams(food);
   const ml = extractExplicitMl(food);
@@ -420,7 +462,9 @@ Return JSON:
       protein: round1(Number(per100g.protein_per_100g) * factor),
       carbs: round1(Number(per100g.carbs_per_100g) * factor),
       fat: round1(Number(per100g.fat_per_100g) * factor),
-      confidence: Number.isFinite(Number(per100g.confidence)) ? Number(per100g.confidence) : 0.7,
+      confidence: Number.isFinite(Number(per100g.confidence))
+        ? Number(per100g.confidence)
+        : 0.7,
       calories_per_100g: Number(per100g.calories_per_100g),
       protein_per_100g: Number(per100g.protein_per_100g),
       carbs_per_100g: Number(per100g.carbs_per_100g),
@@ -512,6 +556,174 @@ async function pickBestCandidateIndex(query, candidates) {
   };
 }
 
+// -------------------- FatSecret search helper --------------------
+async function fatSecretSearch(search_expression) {
+  const fsRes = await axios.get(FATSECRET_API_URL, {
+    params: {
+      method: "foods.search",
+      search_expression,
+      max_results: MAX_RESULTS,
+      format: "json",
+    },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+  return buildCandidates(fsRes.data);
+}
+
+// -------------------- One-pass upgrade attempt --------------------
+async function tryUpgradeFromDb({
+  query,
+  originalFood,
+  aiResult,
+  grams,
+  ml,
+  debug,
+  brandHints,
+  phaseLabel,
+}) {
+  const candidates = await fatSecretSearch(query);
+  if (!candidates.length) {
+    return { upgraded: false, out: null, reason: "no_db_candidates" };
+  }
+
+  const scored = candidates
+    .map((c) => ({ c, s: tokenScore(query, c) }))
+    .sort((a, b) => b.s - a.s);
+
+  const bestDet = scored[0];
+  const top = scored.slice(0, 6).map((x) => x.c);
+
+  if (!bestDet || bestDet.s < MIN_DB_TOKEN_SCORE) {
+    return {
+      upgraded: false,
+      out: null,
+      reason: "db_low_token_score",
+      meta: { best_token_score: bestDet?.s ?? 0 },
+    };
+  }
+
+  let pick = { index: -1, confidence: 0 };
+  try {
+    pick = await pickBestCandidateIndex(query, top);
+  } catch { }
+
+  const chosen = pick.index >= 0 && pick.index < top.length ? top[pick.index] : bestDet.c;
+  const chosenScore = tokenScore(query, chosen);
+  const chosenText = `${chosen.brand || ""} ${chosen.name || ""} ${chosen.description || ""}`;
+
+  // Phrase gate (minimal – only for worst false positives)
+  const phraseMustHave = [];
+  const qNorm = normText(originalFood);
+  if (qNorm.includes("sausage roll")) phraseMustHave.push("sausage", "roll");
+  if (qNorm.includes("chicken tikka masala")) phraseMustHave.push("chicken", "tikka", "masala");
+  if (qNorm.includes("ready salted")) phraseMustHave.push("ready", "salted");
+
+  if (phraseMustHave.length && !containsAllKeywords(chosenText, phraseMustHave)) {
+    return {
+      upgraded: false,
+      out: null,
+      reason: "phrase_gate_failed",
+      meta: { phraseMustHave, chosen: { name: chosen.name, brand: chosen.brand }, chosenScore },
+    };
+  }
+
+  // Brand gate (only for the original query phase — for cleaned query, we allow generic)
+  if (phaseLabel === "primary" || phaseLabel === "brand_stripped") {
+    if (brandHints.length && !containsAllKeywords(chosenText, brandHints)) {
+      return {
+        upgraded: false,
+        out: null,
+        reason: "brand_gate_failed",
+        meta: { brandHints, chosen: { name: chosen.name, brand: chosen.brand }, chosenScore },
+      };
+    }
+  }
+
+  // Coffee-shop intent veto (prevents Tassimo/pods for “medium latte” type queries)
+  if (hasCoffeeShopIntent(originalFood) && isCapsuleOrInstantDrinkCandidate(chosenText)) {
+    return {
+      upgraded: false,
+      out: null,
+      reason: "coffee_shop_format_veto",
+      meta: { chosen: { name: chosen.name, brand: chosen.brand } },
+    };
+  }
+
+  // Confidence gate: if DB pick is weak, prefer AI unless AI itself is low-confidence
+  const aiIsLow = (aiResult?.confidence ?? 0) < MIN_AI_CONFIDENCE;
+  const dbPickIsWeak = pick.confidence < MIN_DB_AI_PICK_CONF;
+  if (dbPickIsWeak && !aiIsLow) {
+    return {
+      upgraded: false,
+      out: null,
+      reason: "db_pick_confidence_low",
+      meta: { db_pick_confidence: pick.confidence, chosenScore },
+    };
+  }
+
+  // Scaling veto
+  if (isScalingMismatch(chosen, grams, ml, query)) {
+    return {
+      upgraded: false,
+      out: null,
+      reason: "db_scaling_mismatch_veto",
+      meta: { chosen: { name: chosen.name, brand: chosen.brand }, chosenScore },
+    };
+  }
+
+  // If we’re in cleaned-query phase, only accept if strong generic + scalable
+  if (phaseLabel === "cleaned_retry") {
+    if (!isStrongGenericFallbackAllowed(query, chosen, chosenScore, grams, ml)) {
+      return {
+        upgraded: false,
+        out: null,
+        reason: "cleaned_retry_not_strong_enough",
+        meta: { chosenScore },
+      };
+    }
+  }
+
+  const scaled = scaleCandidate(chosen, grams, ml);
+
+  const dbResult = {
+    source: "fatsecret",
+    mode: scaled.mode,
+    name: chosen.brand ? `${chosen.brand} ${chosen.name}` : chosen.name,
+    grams: grams ?? null,
+    ml: ml ?? null,
+    calories: scaled.calories,
+    protein: scaled.protein,
+    carbs: scaled.carbs,
+    fat: scaled.fat,
+    confidence: 0.9,
+    ...(debug
+      ? {
+        debug: {
+          upgraded_from_ai: true,
+          via: phaseLabel,
+          query_used: query,
+          ai_confidence: aiResult?.confidence ?? null,
+          best_token_score: bestDet.s,
+          chosen_token_score: chosenScore,
+          db_pick: pick,
+          factor: scaled.factor,
+          per_grams: chosen.per_grams,
+          per_ml: chosen.per_ml,
+          description: chosen.description,
+          candidate_count: candidates.length,
+          prefiltered_count: top.length,
+          thresholds: { MIN_AI_CONFIDENCE, MIN_DB_TOKEN_SCORE, MIN_DB_AI_PICK_CONF },
+        },
+      }
+      : {}),
+  };
+
+  return { upgraded: true, out: dbResult, reason: "upgraded" };
+}
+
 // -------------------- AI-first Hybrid Resolve --------------------
 app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
   const { food, debug } = req.body || {};
@@ -546,289 +758,143 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
 
   const grams = extractExplicitGrams(food);
   const ml = extractExplicitMl(food);
+  const brandHints = extractBrandHints(food);
 
-  // 2) Try to upgrade using FatSecret if it’s a strong match
+  // 2) Try DB upgrade (primary) + at most ONE cleaned retry
   try {
-    const fsRes = await axios.get(FATSECRET_API_URL, {
-      params: {
-        method: "foods.search",
-        search_expression: food,
-        max_results: MAX_RESULTS,
-        format: "json",
-      },
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
+    // Primary attempt
+    const primary = await tryUpgradeFromDb({
+      query: food,
+      originalFood: food,
+      aiResult,
+      grams,
+      ml,
+      debug,
+      brandHints,
+      phaseLabel: "primary",
     });
 
-    const candidates = buildCandidates(fsRes.data);
-    if (!candidates.length) {
-      const out = debug
-        ? { ...aiResult, debug: { used: "ai_only", reason: "no_db_candidates" } }
-        : aiResult;
-      if (!debug) cache.set(cacheKey, out);
-      return res.json(out);
+    if (primary.upgraded) {
+      if (!debug) cache.set(cacheKey, primary.out);
+      return res.json(primary.out);
     }
 
-    // Deterministic prefilter by token score
-    const scored = candidates
-      .map((c) => ({ c, s: tokenScore(food, c) }))
-      .sort((a, b) => b.s - a.s);
-
-    const bestDet = scored[0];
-    const top = scored.slice(0, 6).map((x) => x.c);
-
-    // Brand gate inputs
-    const brandHints = extractBrandHints(food);
-
-    // Phrase gate: minimal, only for the worst false positives
-    const phraseMustHave = [];
-    const qNorm = normText(food);
-    if (qNorm.includes("sausage roll")) phraseMustHave.push("sausage", "roll");
-    if (qNorm.includes("chicken tikka masala")) phraseMustHave.push("chicken", "tikka", "masala");
-    if (qNorm.includes("ready salted")) phraseMustHave.push("ready", "salted");
-
-    // If DB doesn't even vaguely match, keep AI
-    if (!bestDet || bestDet.s < MIN_DB_TOKEN_SCORE) {
-      const out = debug
-        ? {
-            ...aiResult,
-            debug: {
-              used: "ai_only",
-              reason: "db_low_token_score",
-              best_token_score: bestDet?.s ?? 0,
-              min: MIN_DB_TOKEN_SCORE,
-            },
-          }
-        : aiResult;
-      if (!debug) cache.set(cacheKey, out);
-      return res.json(out);
-    }
-
-    // Ask AI to pick among top candidates
-    let pick = { index: -1, confidence: 0 };
-    try {
-      pick = await pickBestCandidateIndex(food, top);
-    } catch {}
-
-    const chosen = pick.index >= 0 && pick.index < top.length ? top[pick.index] : bestDet.c;
-    const chosenScore = tokenScore(food, chosen);
-    const chosenText = `${chosen.brand || ""} ${chosen.name || ""} ${chosen.description || ""}`;
-
-    // Phrase gate check
-    if (phraseMustHave.length && !containsAllKeywords(chosenText, phraseMustHave)) {
-      const out = debug
-        ? {
-            ...aiResult,
-            debug: {
-              used: "ai_only",
-              reason: "phrase_gate_failed",
-              phraseMustHave,
-              chosen: { name: chosen.name, brand: chosen.brand },
-              chosenScore,
-            },
-          }
-        : aiResult;
-      if (!debug) cache.set(cacheKey, out);
-      return res.json(out);
-    }
-
-    // -------------------- BRAND GATE (+ SECOND PASS) --------------------
-    if (brandHints.length && !containsAllKeywords(chosenText, brandHints)) {
+    // If primary failed due to brand gate, we already have brand_stripped as a cheap secondary attempt
+    // (kept from your previous build)
+    if (primary.reason === "brand_gate_failed") {
       const strippedQuery = stripBrandHintsFromQuery(food, brandHints);
+      const brandStripped = await tryUpgradeFromDb({
+        query: strippedQuery,
+        originalFood: food,
+        aiResult,
+        grams,
+        ml,
+        debug,
+        brandHints,
+        phaseLabel: "brand_stripped",
+      });
 
-      // SECOND PASS: retry without brand words (e.g. remove "tesco")
-      try {
-        const fsRes2 = await axios.get(FATSECRET_API_URL, {
-          params: {
-            method: "foods.search",
-            search_expression: strippedQuery,
-            max_results: MAX_RESULTS,
-            format: "json",
-          },
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
-        });
-
-        const candidates2 = buildCandidates(fsRes2.data);
-
-        if (candidates2.length) {
-          const scored2 = candidates2
-            .map((c) => ({ c, s: tokenScore(strippedQuery, c) }))
-            .sort((a, b) => b.s - a.s);
-
-          const best2 = scored2[0];
-          const top2 = scored2.slice(0, 6).map((x) => x.c);
-
-          if (best2 && best2.s >= MIN_DB_TOKEN_SCORE) {
-            let pick2 = { index: -1, confidence: 0 };
-            try {
-              pick2 = await pickBestCandidateIndex(strippedQuery, top2);
-            } catch {}
-
-            const chosen2 =
-              pick2.index >= 0 && pick2.index < top2.length ? top2[pick2.index] : best2.c;
-
-            const chosen2Score = tokenScore(strippedQuery, chosen2);
-            const scalingMismatch2 = isScalingMismatch(chosen2, grams, ml, strippedQuery);
-
-            const aiIsLow = (aiResult?.confidence ?? 0) < MIN_AI_CONFIDENCE;
-            const pick2Ok = pick2.confidence >= MIN_DB_AI_PICK_CONF || aiIsLow;
-
-            if (
-              !scalingMismatch2 &&
-              pick2Ok &&
-              isStrongGenericFallbackAllowed(strippedQuery, chosen2, chosen2Score, grams, ml)
-            ) {
-              const scaled2 = scaleCandidate(chosen2, grams, ml);
-
-              const dbResult2 = {
-                source: "fatsecret",
-                mode: scaled2.mode,
-                name: chosen2.brand ? `${chosen2.brand} ${chosen2.name}` : chosen2.name,
-                grams: grams ?? null,
-                ml: ml ?? null,
-                calories: scaled2.calories,
-                protein: scaled2.protein,
-                carbs: scaled2.carbs,
-                fat: scaled2.fat,
-                confidence: 0.9,
-                ...(debug
-                  ? {
-                      debug: {
-                        upgraded_from_ai: true,
-                        via: "brand_stripped_second_pass",
-                        original_brand_hints: brandHints,
-                        stripped_query: strippedQuery,
-                        best_token_score: best2.s,
-                        chosen_token_score: chosen2Score,
-                        db_pick: pick2,
-                        factor: scaled2.factor,
-                        per_grams: chosen2.per_grams,
-                        per_ml: chosen2.per_ml,
-                        description: chosen2.description,
-                        candidate_count: candidates2.length,
-                        prefiltered_count: top2.length,
-                        thresholds: {
-                          MIN_AI_CONFIDENCE,
-                          MIN_DB_TOKEN_SCORE,
-                          MIN_DB_AI_PICK_CONF,
-                        },
-                      },
-                    }
-                  : {}),
-              };
-
-              if (!debug) cache.set(cacheKey, dbResult2);
-              return res.json(dbResult2);
-            }
-          }
-        }
-      } catch (e) {
-        // ignore, fall back to AI below
+      if (brandStripped.upgraded) {
+        if (!debug) cache.set(cacheKey, brandStripped.out);
+        return res.json(brandStripped.out);
       }
 
-      // If second pass doesn't find a strong scalable match, keep AI
-      const out = debug
-        ? {
+      // ✅ NEW: ONE cleaned retry (hard-capped)
+      const cleaned = cleanQueryForFatSecret(food, brandHints);
+      if (cleaned && cleaned !== strippedQuery && cleaned !== normText(food)) {
+        const cleanedRetry = await tryUpgradeFromDb({
+          query: cleaned,
+          originalFood: food,
+          aiResult,
+          grams,
+          ml,
+          debug,
+          brandHints,
+          phaseLabel: "cleaned_retry",
+        });
+
+        if (cleanedRetry.upgraded) {
+          if (!debug) cache.set(cacheKey, cleanedRetry.out);
+          return res.json(cleanedRetry.out);
+        }
+
+        // Return AI with debug explaining both failed
+        const out = debug
+          ? {
             ...aiResult,
             debug: {
               used: "ai_only",
-              reason: "brand_gate_failed",
-              brandHints,
-              chosen: { name: chosen.name, brand: chosen.brand },
-              chosenScore,
-              second_pass_query: strippedQuery,
+              reason: "db_upgrade_failed_after_one_retry",
+              primary: { reason: primary.reason, meta: primary.meta },
+              brand_stripped: { query: strippedQuery, reason: brandStripped.reason, meta: brandStripped.meta },
+              cleaned_retry: { query: cleaned, reason: cleanedRetry.reason, meta: cleanedRetry.meta },
             },
           }
+          : aiResult;
+
+        if (!debug) cache.set(cacheKey, out);
+        return res.json(out);
+      }
+
+      // No cleaned retry possible; return AI
+      const out = debug
+        ? {
+          ...aiResult,
+          debug: {
+            used: "ai_only",
+            reason: "brand_gate_failed_no_cleaned_retry",
+            primary: { reason: primary.reason, meta: primary.meta },
+            brand_stripped: { query: strippedQuery, reason: brandStripped.reason, meta: brandStripped.meta },
+          },
+        }
         : aiResult;
 
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
-    // -------------------- END BRAND GATE (+ SECOND PASS) --------------------
 
-    // If DB pick confidence is weak, prefer AI unless AI itself is low-confidence
-    const aiIsLow = (aiResult?.confidence ?? 0) < MIN_AI_CONFIDENCE;
-    const dbPickIsWeak = pick.confidence < MIN_DB_AI_PICK_CONF;
+    // For non-brand failures, do ONE cleaned retry (hard-capped) only if it meaningfully changes the query
+    const cleaned = cleanQueryForFatSecret(food, brandHints);
+    if (cleaned && cleaned !== normText(food)) {
+      const cleanedRetry = await tryUpgradeFromDb({
+        query: cleaned,
+        originalFood: food,
+        aiResult,
+        grams,
+        ml,
+        debug,
+        brandHints,
+        phaseLabel: "cleaned_retry",
+      });
 
-    if (dbPickIsWeak && !aiIsLow) {
+      if (cleanedRetry.upgraded) {
+        if (!debug) cache.set(cacheKey, cleanedRetry.out);
+        return res.json(cleanedRetry.out);
+      }
+
       const out = debug
         ? {
-            ...aiResult,
-            debug: {
-              used: "ai_only",
-              reason: "db_pick_confidence_low",
-              db_pick_confidence: pick.confidence,
-              min: MIN_DB_AI_PICK_CONF,
-              chosenScore,
-            },
-          }
+          ...aiResult,
+          debug: {
+            used: "ai_only",
+            reason: "db_upgrade_failed_after_one_retry",
+            primary: { reason: primary.reason, meta: primary.meta },
+            cleaned_retry: { query: cleaned, reason: cleanedRetry.reason, meta: cleanedRetry.meta },
+          },
+        }
         : aiResult;
+
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
 
-    // Scaling veto (generic)
-    if (isScalingMismatch(chosen, grams, ml, food)) {
-      const out = debug
-        ? {
-            ...aiResult,
-            debug: {
-              used: "ai_only",
-              reason: "db_scaling_mismatch_veto",
-              chosen: { name: chosen.name, brand: chosen.brand },
-              chosenScore,
-            },
-          }
-        : aiResult;
-      if (!debug) cache.set(cacheKey, out);
-      return res.json(out);
-    }
+    // Default: keep AI
+    const out = debug
+      ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
+      : aiResult;
 
-    // Scale DB candidate deterministically
-    const scaled = scaleCandidate(chosen, grams, ml);
-
-    const dbResult = {
-      source: "fatsecret",
-      mode: scaled.mode,
-      name: chosen.brand ? `${chosen.brand} ${chosen.name}` : chosen.name,
-      grams: grams ?? null,
-      ml: ml ?? null,
-      calories: scaled.calories,
-      protein: scaled.protein,
-      carbs: scaled.carbs,
-      fat: scaled.fat,
-      confidence: 0.9,
-      ...(debug
-        ? {
-            debug: {
-              upgraded_from_ai: true,
-              ai_confidence: aiResult?.confidence ?? null,
-              best_token_score: bestDet.s,
-              chosen_token_score: chosenScore,
-              db_pick: pick,
-              factor: scaled.factor,
-              per_grams: chosen.per_grams,
-              per_ml: chosen.per_ml,
-              description: chosen.description,
-              candidate_count: candidates.length,
-              prefiltered_count: top.length,
-              thresholds: {
-                MIN_AI_CONFIDENCE,
-                MIN_DB_TOKEN_SCORE,
-                MIN_DB_AI_PICK_CONF,
-              },
-            },
-          }
-        : {}),
-    };
-
-    if (!debug) cache.set(cacheKey, dbResult);
-    return res.json(dbResult);
+    if (!debug) cache.set(cacheKey, out);
+    return res.json(out);
   } catch (err) {
     // DB failure should never break UX — return AI result
     console.error("FatSecret resolve error:", err.response?.data || err.message || err);
