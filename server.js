@@ -135,6 +135,23 @@ function buildFatSecretCandidates(fsData) {
   }));
 }
 
+// Detect “composite” multi-item inputs (e.g. "2 eggs and toast with butter").
+// For composites, it's better UX to go straight to AI rather than forcing a single DB match.
+function looksComposite(text) {
+  const t = String(text || "").toLowerCase();
+
+  // common separators indicating multiple foods
+  if (t.includes(" and ") || t.includes(",") || t.includes(" + ")) return true;
+
+  // If it has 2+ explicit quantity patterns, treat as composite
+  const qtyMatches = t.match(
+    /\b\d+(\.\d+)?\s*(x\s*)?(slice|slices|egg|eggs|tbsp|tsp|cup|cups|bar|bars|piece|pieces|portion|portions)\b/g
+  );
+  if (qtyMatches && qtyMatches.length >= 2) return true;
+
+  return false;
+}
+
 // -------------------- Internal AI estimate (fallback + quick add) --------------------
 async function estimateWithGPT(food) {
   const grams = extractExplicitGrams(food);
@@ -261,6 +278,14 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
+    // NEW: Composite inputs go straight to AI (avoids nonsense single-item DB picks)
+    if (looksComposite(food)) {
+      const fallback = await estimateWithGPT(food);
+      if (debug) fallback.debug = { fallback_reason: "composite_input_detected" };
+      cache.set(cacheKey, fallback);
+      return res.json(fallback);
+    }
+
     // 1) FatSecret search
     let fsData = null;
     try {
@@ -295,7 +320,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
 
     // 2) AI layer: select best match + return ONE normalized card
     // FIX: Only scale when candidate.description explicitly says "Per 100g".
-    // Never assume "Per 1 bar" or "Per serving" equals 100g.
     const selector = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0.1,
