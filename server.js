@@ -33,14 +33,16 @@ app.use(
 );
 
 // -------------------- Clients --------------------
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 // -------------------- FatSecret --------------------
 const FATSECRET_API_URL = "https://platform.fatsecret.com/rest/server.api";
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-const cache = new NodeCache({ stdTTL: 300 }); // 5 mins
+const cache = new NodeCache({ stdTTL: 300 }); // 5 minutes
 
 let accessToken = null;
 let tokenExpirationTime = 0;
@@ -64,7 +66,7 @@ async function getAccessToken() {
 async function ensureFatSecretToken(req, res, next) {
   try {
     if (!CLIENT_ID || !CLIENT_SECRET) {
-      return res.status(500).json({ error: "CLIENT_ID/CLIENT_SECRET missing" });
+      return res.status(500).json({ error: "CLIENT_ID/CLIENT_SECRET not set" });
     }
     if (!accessToken || Date.now() >= tokenExpirationTime) {
       await getAccessToken();
@@ -72,17 +74,17 @@ async function ensureFatSecretToken(req, res, next) {
     next();
   } catch (err) {
     console.error("FatSecret token error:", err.response?.data || err.message || err);
-    return res.status(500).json({ error: "Failed to fetch access token" });
+    return res.status(500).json({ error: "Failed to fetch FatSecret access token" });
   }
 }
 
 // -------------------- Health --------------------
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// -------------------- Passthrough search (keep for debugging / UI) --------------------
+// -------------------- FatSecret passthrough (optional) --------------------
 app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
   const { search_expression, max_results, format } = req.query;
-  const cacheKey = `fssearch:${search_expression}:${max_results || ""}:${format || "json"}`;
+  const cacheKey = `fs:${search_expression}:${max_results || 12}:${format || "json"}`;
 
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
@@ -111,11 +113,55 @@ app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
   }
 });
 
-// -------------------- Parsing helpers --------------------
+// -------------------- Config thresholds (tune later) --------------------
+const MIN_AI_CONFIDENCE = 0.65;      // if AI confidence below this, prefer DB if DB is strong
+const MIN_DB_TOKEN_SCORE = 0.35;     // DB must “look like” the query
+const MIN_DB_AI_PICK_CONF = 0.60;    // AI must be reasonably confident in chosen DB candidate
+const MAX_RESULTS = 12;
+
+// -------------------- Text helpers --------------------
+function normText(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function tokenize(s) {
+  return normText(s).split(" ").filter(Boolean);
+}
+
+function tokenScore(query, candidate) {
+  const qTokens = tokenize(query);
+  const q = new Set(qTokens);
+  if (!q.size) return 0;
+
+  const cTokens = tokenize(`${candidate.brand || ""} ${candidate.name || ""} ${candidate.description || ""}`);
+  let hit = 0;
+  for (const t of cTokens) if (q.has(t)) hit++;
+
+  return hit / Math.max(4, qTokens.length);
+}
+
+function extractBrandHints(query) {
+  const q = normText(query);
+  const hints = [];
+  // Add more over time if needed, but this is NOT required for correctness.
+  // This is just to prevent obvious brand mismatches like "Greggs" -> random sausage.
+  const known = ["greggs", "walkers", "tesco", "costa", "mcdonald", "mcdonalds", "coca", "coca-cola", "coca cola", "alpro"];
+  for (const k of known) {
+    if (q.includes(k)) hints.push(k);
+  }
+  return hints;
+}
+
+function containsAllKeywords(haystack, words) {
+  const h = normText(haystack);
+  return words.every(w => h.includes(normText(w)));
+}
+
+// -------------------- Quantity extractors --------------------
 function extractExplicitGrams(text) {
-  const m = String(text).match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
-  if (!m) return null;
-  const grams = Number(m[1]);
+  const match = String(text).match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
+  if (!match) return null;
+  const grams = Number(match[1]);
   return Number.isFinite(grams) && grams > 0 ? grams : null;
 }
 
@@ -157,18 +203,31 @@ function extractPerFlOzAsMl(desc) {
   if (!m) return null;
   const flOz = Number(m[1]);
   if (!Number.isFinite(flOz) || flOz <= 0) return null;
-  return flOz * 29.5735; // US fl oz → ml
+  return flOz * 29.5735;
 }
 
+// Generic serving-unit detector: "Per 1 ___" or "Per serving"
 function looksPerServingUnit(desc) {
   const d = String(desc || "");
-  // Generic: "Per 1 anything" + "Per serving"
   if (/\bPer\s+1\s+[A-Za-z]/i.test(d)) return true;
   if (/\bPer\s+serving\b/i.test(d)) return true;
   return false;
 }
 
-// Parse FatSecret macros from description
+// Snack-pack allowlist: if query grams look like a single-pack (25–80g) and DB says "Per 1 bag/pack"
+function looksLikeSnackPackQuery(query, grams) {
+  if (!grams) return false;
+  if (grams < 20 || grams > 100) return false;
+  const q = normText(query);
+  return q.includes("crisps") || q.includes("chips") || q.includes("snack") || q.includes("bag") || q.includes("pack");
+}
+
+function isBagOrPackServing(desc) {
+  const d = normText(desc);
+  return d.includes("per 1 bag") || d.includes("per 1 pack") || d.includes("per bag") || d.includes("per pack");
+}
+
+// -------------------- Nutrition parser --------------------
 function parseNutrition(desc) {
   const d = String(desc || "");
 
@@ -196,7 +255,7 @@ function round1(n) {
   return Number(x.toFixed(1));
 }
 
-// -------------------- Candidate builder --------------------
+// -------------------- Build FatSecret candidates --------------------
 function buildCandidates(fsData) {
   const foods = fsData?.foods?.food || [];
   const arr = Array.isArray(foods) ? foods : [foods];
@@ -204,24 +263,20 @@ function buildCandidates(fsData) {
   return arr
     .map((f) => {
       const desc = f.food_description || "";
-      const perG = extractPerGrams(desc);
-      const perMl = extractPerMl(desc) ?? extractPerFlOzAsMl(desc);
-      const nutrition = parseNutrition(desc);
-
       return {
         id: f.food_id,
         name: f.food_name || "",
         brand: f.brand_name || null,
         description: desc,
-        nutrition,
-        per_grams: perG,
-        per_ml: perMl,
+        nutrition: parseNutrition(desc),
+        per_grams: extractPerGrams(desc),
+        per_ml: extractPerMl(desc) ?? extractPerFlOzAsMl(desc),
       };
     })
     .filter((c) => c.nutrition);
 }
 
-// -------------------- Deterministic scaling --------------------
+// -------------------- Deterministic scaling for DB candidate --------------------
 function scaleCandidate(candidate, grams, ml) {
   const base = candidate.nutrition;
   let factor = 1;
@@ -245,57 +300,125 @@ function scaleCandidate(candidate, grams, ml) {
   };
 }
 
-// -------------------- Generic mismatch rule --------------------
-// If user gave grams/ml but candidate is "Per 1 ___" (serving unit) and not scalable → veto
-function isMismatch(candidate, grams, ml) {
-  if (grams && !candidate.per_grams && looksPerServingUnit(candidate.description)) return true;
+// -------------------- DB scaling veto (generic) --------------------
+function isScalingMismatch(candidate, grams, ml, query) {
+  // if explicit grams/ml but candidate is "Per 1 ___" and not scalable -> veto
+  if (grams && !candidate.per_grams && looksPerServingUnit(candidate.description)) {
+    // except snack-pack case where "Per 1 bag/pack" is acceptable
+    if (looksLikeSnackPackQuery(query, grams) && isBagOrPackServing(candidate.description)) {
+      return false;
+    }
+    return true;
+  }
   if (ml && !candidate.per_ml && looksPerServingUnit(candidate.description)) return true;
   return false;
 }
 
-// -------------------- Deterministic semantic gate (stops mackerel/crisps) --------------------
-function tokenize(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-}
+// -------------------- AI: estimate (single brain for resolve) --------------------
+async function estimateAI(food) {
+  const grams = extractExplicitGrams(food);
+  const ml = extractExplicitMl(food);
 
-function tokenScore(query, candidate) {
-  const qTokens = tokenize(query);
-  const q = new Set(qTokens);
+  // grams => per 100g + scale in code (more consistent)
+  if (grams) {
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      text: { format: { type: "json_object" } },
+      input: [
+        {
+          role: "system",
+          content:
+            "Return ONLY valid JSON. Always return values strictly PER 100g for the described food. Do NOT scale totals.",
+        },
+        {
+          role: "user",
+          content: `Food description: "${food}"
 
-  if (!q.size) return 0;
+Return JSON:
+{
+  "name": string,
+  "calories_per_100g": number,
+  "protein_per_100g": number,
+  "carbs_per_100g": number,
+  "fat_per_100g": number,
+  "confidence": number
+}`,
+        },
+      ],
+    });
 
-  const cTokens = tokenize(`${candidate.brand || ""} ${candidate.name || ""} ${candidate.description || ""}`);
+    const per100g = JSON.parse(response.output_text);
+    const factor = grams / 100;
 
-  let hit = 0;
-  for (const t of cTokens) {
-    if (q.has(t)) hit++;
+    return {
+      source: "ai",
+      mode: "weight",
+      name: per100g.name,
+      grams,
+      ml: null,
+      calories: Math.round(Number(per100g.calories_per_100g) * factor),
+      protein: round1(Number(per100g.protein_per_100g) * factor),
+      carbs: round1(Number(per100g.carbs_per_100g) * factor),
+      fat: round1(Number(per100g.fat_per_100g) * factor),
+      confidence: Number.isFinite(Number(per100g.confidence)) ? Number(per100g.confidence) : 0.7,
+      // keep per-100g details for debug/tuning
+      calories_per_100g: Number(per100g.calories_per_100g),
+      protein_per_100g: Number(per100g.protein_per_100g),
+      carbs_per_100g: Number(per100g.carbs_per_100g),
+      fat_per_100g: Number(per100g.fat_per_100g),
+    };
   }
 
-  // normalize a bit so short queries aren't too harsh
-  return hit / Math.max(4, qTokens.length);
+  // ml (drinks) or no quantity => serving estimate
+  const response = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    temperature: 0.2,
+    text: { format: { type: "json_object" } },
+    input: [
+      {
+        role: "system",
+        content:
+          "Return ONLY valid JSON. If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup, 330ml), estimate nutrition for that portion. If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
+      },
+      {
+        role: "user",
+        content: `Food description: "${food}"
+
+Return JSON:
+{
+  "name": string,
+  "serving_description": string,
+  "estimated_serving_grams": number,
+  "calories": number,
+  "protein": number,
+  "carbs": number,
+  "fat": number,
+  "confidence": number
+}`,
+      },
+    ],
+  });
+
+  const j = JSON.parse(response.output_text);
+
+  return {
+    source: "ai",
+    mode: ml ? "volume" : "serving",
+    name: j.name,
+    grams: Number.isFinite(Number(j.estimated_serving_grams)) ? Number(j.estimated_serving_grams) : null,
+    ml: ml ?? null,
+    serving_description: j.serving_description,
+    calories: Math.round(Number(j.calories) || 0),
+    protein: round1(Number(j.protein) || 0),
+    carbs: round1(Number(j.carbs) || 0),
+    fat: round1(Number(j.fat) || 0),
+    confidence: Number.isFinite(Number(j.confidence)) ? Number(j.confidence) : 0.65,
+  };
 }
 
-function bestTokenMatch(query, candidates) {
-  let best = null;
-  let bestScore = -1;
-
-  for (const c of candidates) {
-    const s = tokenScore(query, c);
-    if (s > bestScore) {
-      bestScore = s;
-      best = c;
-    }
-  }
-  return { best, bestScore };
-}
-
-// -------------------- AI candidate selector --------------------
-async function pickBestCandidateIndex(food, candidates) {
-  // Keep it cheap: only send name+brand+description
+// -------------------- AI: choose best DB candidate among top-N --------------------
+async function pickBestCandidateIndex(query, candidates) {
   const simplified = candidates.map((c, i) => ({
     index: i,
     name: c.name,
@@ -313,12 +436,12 @@ async function pickBestCandidateIndex(food, candidates) {
         content:
           "Pick the single best matching candidate index for the query.\n" +
           "Return ONLY JSON: {\"index\": number, \"confidence\": number}\n" +
-          "Do not pick unrelated foods.\n" +
-          "If unsure, pick the closest by name/brand.\n",
+          "Do NOT pick unrelated foods.\n" +
+          "Prefer exact brand/name matches.\n",
       },
       {
         role: "user",
-        content: JSON.stringify({ query: food, candidates: simplified }),
+        content: JSON.stringify({ query, candidates: simplified }),
       },
     ],
   });
@@ -333,131 +456,49 @@ async function pickBestCandidateIndex(food, candidates) {
   };
 }
 
-// -------------------- AI fallback (never crash) --------------------
-async function aiFallback(food) {
-  // Two modes:
-  // - if explicit grams: ask per-100g and scale in code (more consistent)
-  // - else serving estimate
-  const grams = extractExplicitGrams(food);
-  const ml = extractExplicitMl(food);
-
-  if (grams) {
-    const r = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      temperature: 0.2,
-      text: { format: { type: "json_object" } },
-      input: [
-        {
-          role: "system",
-          content:
-            "Return ONLY JSON. Provide nutrition strictly PER 100g. Do NOT scale totals.",
-        },
-        {
-          role: "user",
-          content: `Food: "${food}"
-Return:
-{
-  "name": string,
-  "calories_per_100g": number,
-  "protein_per_100g": number,
-  "carbs_per_100g": number,
-  "fat_per_100g": number,
-  "confidence": number
-}`,
-        },
-      ],
-    });
-
-    const j = JSON.parse(r.output_text);
-    const factor = grams / 100;
-
-    return {
-      source: "ai",
-      mode: "weight",
-      name: j.name,
-      grams,
-      ml: null,
-      calories: Math.round(Number(j.calories_per_100g) * factor),
-      protein: round1(Number(j.protein_per_100g) * factor),
-      carbs: round1(Number(j.carbs_per_100g) * factor),
-      fat: round1(Number(j.fat_per_100g) * factor),
-      confidence: Number.isFinite(Number(j.confidence)) ? Number(j.confidence) : 0.75,
-      calories_per_100g: Number(j.calories_per_100g),
-      protein_per_100g: Number(j.protein_per_100g),
-      carbs_per_100g: Number(j.carbs_per_100g),
-      fat_per_100g: Number(j.fat_per_100g),
-    };
-  }
-
-  // If ml given and it's a drink, AI can do serving; DB will often be better, but fallback is fine.
-  const r = await openai.responses.create({
-    model: "gpt-4.1-mini",
-    temperature: 0.2,
-    text: { format: { type: "json_object" } },
-    input: [
-      {
-        role: "system",
-        content:
-          "Return ONLY JSON. Estimate nutrition for the described portion. If no portion, assume typical single serving in the UK.",
-      },
-      {
-        role: "user",
-        content: `Food: "${food}"
-Return:
-{
-  "name": string,
-  "serving_description": string,
-  "estimated_serving_grams": number,
-  "calories": number,
-  "protein": number,
-  "carbs": number,
-  "fat": number,
-  "confidence": number
-}`,
-      },
-    ],
-  });
-
-  const j = JSON.parse(r.output_text);
-  return {
-    source: "ai",
-    mode: "serving",
-    name: j.name,
-    grams: Number.isFinite(Number(j.estimated_serving_grams)) ? Number(j.estimated_serving_grams) : null,
-    ml: ml ?? null,
-    serving_description: j.serving_description,
-    calories: Math.round(Number(j.calories) || 0),
-    protein: round1(Number(j.protein) || 0),
-    carbs: round1(Number(j.carbs) || 0),
-    fat: round1(Number(j.fat) || 0),
-    confidence: Number.isFinite(Number(j.confidence)) ? Number(j.confidence) : 0.7,
-  };
-}
-
-// -------------------- Hybrid resolve --------------------
+// -------------------- AI-first Hybrid Resolve --------------------
 app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
   const { food, debug } = req.body || {};
 
-  // Always validate input
   if (!food || typeof food !== "string") {
     return res.status(400).json({ error: "food is required" });
   }
 
-  // Cache resolve results (helps with repeated quick-add)
-  const cacheKey = `resolve:${food}`;
+  const cacheKey = `resolve-ai-first:${food}`;
   const cached = cache.get(cacheKey);
   if (cached && !debug) return res.json(cached);
+
+  // 1) Always compute AI result first (UX stable)
+  let aiResult;
+  try {
+    aiResult = await estimateAI(food);
+  } catch (err) {
+    console.error("AI estimate failed:", err.response?.data || err.message || err);
+    // ultra-safe fallback if OpenAI fails
+    aiResult = {
+      source: "ai",
+      mode: "serving",
+      name: food,
+      grams: null,
+      ml: null,
+      calories: 0,
+      protein: 0,
+      carbs: 0,
+      fat: 0,
+      confidence: 0.1,
+    };
+  }
 
   const grams = extractExplicitGrams(food);
   const ml = extractExplicitMl(food);
 
+  // 2) Try to upgrade using FatSecret if it’s a strong match
   try {
-    // 1) FatSecret search
     const fsRes = await axios.get(FATSECRET_API_URL, {
       params: {
         method: "foods.search",
         search_expression: food,
-        max_results: 12,
+        max_results: MAX_RESULTS,
         format: "json",
       },
       headers: {
@@ -467,73 +508,94 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     });
 
     const candidates = buildCandidates(fsRes.data);
-
-    // If no candidates → AI fallback
     if (!candidates.length) {
-      const fb = await aiFallback(food);
-      if (!debug) cache.set(cacheKey, fb);
-      return res.json(debug ? { ...fb, debug: { fallback: true, reason: "no_candidates" } } : fb);
+      const out = debug ? { ...aiResult, debug: { used: "ai_only", reason: "no_db_candidates" } } : aiResult;
+      if (!debug) cache.set(cacheKey, out);
+      return res.json(out);
     }
 
-    // 2) Deterministic pre-filter: pick top candidates by token score
-    // This makes AI selection robust and prevents "mackerel for crisps"
+    // Deterministic prefilter by token score
     const scored = candidates
       .map((c) => ({ c, s: tokenScore(food, c) }))
       .sort((a, b) => b.s - a.s);
 
-    const top = scored.slice(0, 6).map((x) => x.c);
     const bestDet = scored[0];
+    const top = scored.slice(0, 6).map((x) => x.c);
 
-    // If nothing even vaguely matches, bail to AI early
-    const MIN_TOKEN_SCORE = 0.25;
-    if (!bestDet || bestDet.s < MIN_TOKEN_SCORE) {
-      const fb = await aiFallback(food);
+    // Brand gate: if query contains a strong brand hint, require it appears somewhere in chosen candidate text
+    const brandHints = extractBrandHints(food);
+
+    // Phrase gate: simple compound phrase constraint for common cases like "sausage roll"
+    const qTokens = tokenize(food);
+    const phraseMustHave = [];
+    if (normText(food).includes("sausage roll")) phraseMustHave.push("sausage", "roll");
+    if (normText(food).includes("chicken tikka masala")) phraseMustHave.push("chicken", "tikka", "masala");
+    if (normText(food).includes("ready salted")) phraseMustHave.push("ready", "salted");
+
+    // If DB doesn't even vaguely match, keep AI
+    if (!bestDet || bestDet.s < MIN_DB_TOKEN_SCORE) {
       const out = debug
-        ? { ...fb, debug: { fallback: true, reason: "low_token_match", best_token_score: bestDet?.s ?? 0, min: MIN_TOKEN_SCORE } }
-        : fb;
+        ? { ...aiResult, debug: { used: "ai_only", reason: "db_low_token_score", best_token_score: bestDet?.s ?? 0, min: MIN_DB_TOKEN_SCORE } }
+        : aiResult;
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
 
-    // 3) AI choose among top candidates (safe)
-    let chosen = null;
-    let aiPick = { index: -1, confidence: 0 };
-
+    // Ask AI to pick among top candidates
+    let pick = { index: -1, confidence: 0 };
     try {
-      aiPick = await pickBestCandidateIndex(food, top);
-      if (aiPick.index >= 0 && aiPick.index < top.length) {
-        chosen = top[aiPick.index];
-      }
+      pick = await pickBestCandidateIndex(food, top);
     } catch (e) {
-      // If OpenAI fails, fall back to best deterministic match
-      chosen = bestDet.c;
+      // ignore, fallback to deterministic best
+      pick = { index: -1, confidence: 0 };
     }
 
-    // 4) Final safety: ensure chosen still meets minimum token match
-    const chosenScore = chosen ? tokenScore(food, chosen) : 0;
-    if (!chosen || chosenScore < MIN_TOKEN_SCORE) {
-      const fb = await aiFallback(food);
+    const chosen = pick.index >= 0 && pick.index < top.length ? top[pick.index] : bestDet.c;
+    const chosenScore = tokenScore(food, chosen);
+
+    // Apply brand/phrase gates
+    const chosenText = `${chosen.brand || ""} ${chosen.name || ""} ${chosen.description || ""}`;
+    if (brandHints.length && !containsAllKeywords(chosenText, brandHints)) {
       const out = debug
-        ? { ...fb, debug: { fallback: true, reason: "chosen_low_token_match", chosenScore, min: MIN_TOKEN_SCORE } }
-        : fb;
+        ? { ...aiResult, debug: { used: "ai_only", reason: "brand_gate_failed", brandHints, chosen: { name: chosen.name, brand: chosen.brand }, chosenScore } }
+        : aiResult;
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
 
-    // 5) Mismatch/scaling veto (grams/ml vs per-1-unit)
-    if (isMismatch(chosen, grams, ml)) {
-      const fb = await aiFallback(food);
+    if (phraseMustHave.length && !containsAllKeywords(chosenText, phraseMustHave)) {
       const out = debug
-        ? { ...fb, debug: { fallback: true, reason: "scaling_mismatch_veto" } }
-        : fb;
+        ? { ...aiResult, debug: { used: "ai_only", reason: "phrase_gate_failed", phraseMustHave, chosen: { name: chosen.name, brand: chosen.brand }, chosenScore } }
+        : aiResult;
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
 
-    // 6) Scale deterministically
+    // If AI isn’t confident about this DB pick, prefer AI unless AI itself is low-confidence
+    const aiIsLow = (aiResult?.confidence ?? 0) < MIN_AI_CONFIDENCE;
+    const dbPickIsWeak = pick.confidence < MIN_DB_AI_PICK_CONF;
+
+    if (dbPickIsWeak && !aiIsLow) {
+      const out = debug
+        ? { ...aiResult, debug: { used: "ai_only", reason: "db_pick_confidence_low", db_pick_confidence: pick.confidence, min: MIN_DB_AI_PICK_CONF, chosenScore } }
+        : aiResult;
+      if (!debug) cache.set(cacheKey, out);
+      return res.json(out);
+    }
+
+    // Scaling veto (generic)
+    if (isScalingMismatch(chosen, grams, ml, food)) {
+      const out = debug
+        ? { ...aiResult, debug: { used: "ai_only", reason: "db_scaling_mismatch_veto", chosen: { name: chosen.name, brand: chosen.brand }, chosenScore } }
+        : aiResult;
+      if (!debug) cache.set(cacheKey, out);
+      return res.json(out);
+    }
+
+    // Scale DB candidate deterministically
     const scaled = scaleCandidate(chosen, grams, ml);
 
-    const result = {
+    const dbResult = {
       source: "fatsecret",
       mode: scaled.mode,
       name: chosen.brand ? `${chosen.brand} ${chosen.name}` : chosen.name,
@@ -543,54 +605,43 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       protein: scaled.protein,
       carbs: scaled.carbs,
       fat: scaled.fat,
-      confidence: 0.9, // UI confidence (we keep stable)
+      confidence: 0.9,
       ...(debug
         ? {
-            debug: {
-              chosen_name: chosen.name,
-              chosen_brand: chosen.brand,
-              token_score: chosenScore,
-              best_token_score: bestDet.s,
-              ai_pick: aiPick,
-              factor: scaled.factor,
-              per_grams: chosen.per_grams,
-              per_ml: chosen.per_ml,
-              description: chosen.description,
-              candidate_count: candidates.length,
-              prefiltered_count: top.length,
-              min_token_score: MIN_TOKEN_SCORE,
+          debug: {
+            upgraded_from_ai: true,
+            ai_confidence: aiResult?.confidence ?? null,
+            best_token_score: bestDet.s,
+            chosen_token_score: chosenScore,
+            db_pick: pick,
+            factor: scaled.factor,
+            per_grams: chosen.per_grams,
+            per_ml: chosen.per_ml,
+            description: chosen.description,
+            candidate_count: candidates.length,
+            prefiltered_count: top.length,
+            thresholds: {
+              MIN_AI_CONFIDENCE,
+              MIN_DB_TOKEN_SCORE,
+              MIN_DB_AI_PICK_CONF,
             },
-          }
+          },
+        }
         : {}),
     };
 
-    if (!debug) cache.set(cacheKey, result);
-    return res.json(result);
+    // If AI confidence is very high and DB upgrade is only marginal match, you can keep AI.
+    // (Optional: commented out for now; you can enable later)
+    // if ((aiResult?.confidence ?? 0) >= 0.9 && chosenScore < 0.55) return res.json(aiResult);
+
+    if (!debug) cache.set(cacheKey, dbResult);
+    return res.json(dbResult);
   } catch (err) {
-    // ✅ NEVER 500 on resolve; always return AI fallback
-    console.error("RESOLVE ERROR:", err.response?.data || err.message || err);
-    try {
-      const fb = await aiFallback(food);
-      const out = debug ? { ...fb, debug: { fallback: true, reason: "exception", error: err.message } } : fb;
-      if (!debug) cache.set(cacheKey, out);
-      return res.json(out);
-    } catch (e) {
-      console.error("FALLBACK ERROR:", e.message || e);
-      // absolute last resort
-      return res.json({
-        source: "ai",
-        mode: "serving",
-        name: food,
-        grams: grams ?? null,
-        ml: ml ?? null,
-        calories: 0,
-        protein: 0,
-        carbs: 0,
-        fat: 0,
-        confidence: 0.1,
-        ...(debug ? { debug: { fallback: true, reason: "fallback_failed" } } : {}),
-      });
-    }
+    // DB failure should never break UX — return AI result
+    console.error("FatSecret resolve error:", err.response?.data || err.message || err);
+    const out = debug ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } } : aiResult;
+    if (!debug) cache.set(cacheKey, out);
+    return res.json(out);
   }
 });
 
