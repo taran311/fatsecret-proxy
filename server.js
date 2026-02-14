@@ -89,9 +89,8 @@ app.get("/health", (req, res) => res.status(200).send("OK"));
 // -------------------- FatSecret passthrough (optional) --------------------
 app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
   const { search_expression, max_results, format } = req.query;
-  const cacheKey = `fs:${search_expression}:${max_results || 12}:${
-    format || "json"
-  }`;
+  const cacheKey = `fs:${search_expression}:${max_results || 12}:${format || "json"
+    }`;
 
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
@@ -408,7 +407,7 @@ async function estimateAI(food) {
   if (grams) {
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
-      temperature: 0.2,
+      temperature: 0.05,
       text: { format: { type: "json_object" } },
       input: [
         {
@@ -456,7 +455,7 @@ Return JSON:
 
   const response = await openai.responses.create({
     model: "gpt-4.1-mini",
-    temperature: 0.2,
+    temperature: 0.05,
     text: { format: { type: "json_object" } },
     input: [
       {
@@ -590,7 +589,7 @@ async function tryUpgradeFromDb({
   let pick = { index: -1, confidence: 0 };
   try {
     pick = await pickBestCandidateIndex(query, top);
-  } catch {}
+  } catch { }
 
   const chosen = pick.index >= 0 && pick.index < top.length ? top[pick.index] : bestDet.c;
   const chosenScore = tokenScore(query, chosen);
@@ -683,23 +682,23 @@ async function tryUpgradeFromDb({
     confidence: 0.9,
     ...(debug
       ? {
-          debug: {
-            upgraded_from_ai: true,
-            via: phaseLabel,
-            query_used: query,
-            ai_confidence: aiResult?.confidence ?? null,
-            best_token_score: bestDet.s,
-            chosen_token_score: chosenScore,
-            db_pick: pick,
-            factor: scaled.factor,
-            per_grams: chosen.per_grams,
-            per_ml: chosen.per_ml,
-            description: chosen.description,
-            candidate_count: candidates.length,
-            prefiltered_count: top.length,
-            thresholds: { MIN_AI_CONFIDENCE, MIN_DB_TOKEN_SCORE, MIN_DB_AI_PICK_CONF },
-          },
-        }
+        debug: {
+          upgraded_from_ai: true,
+          via: phaseLabel,
+          query_used: query,
+          ai_confidence: aiResult?.confidence ?? null,
+          best_token_score: bestDet.s,
+          chosen_token_score: chosenScore,
+          db_pick: pick,
+          factor: scaled.factor,
+          per_grams: chosen.per_grams,
+          per_ml: chosen.per_ml,
+          description: chosen.description,
+          candidate_count: candidates.length,
+          prefiltered_count: top.length,
+          thresholds: { MIN_AI_CONFIDENCE, MIN_DB_TOKEN_SCORE, MIN_DB_AI_PICK_CONF },
+        },
+      }
       : {}),
   };
 
@@ -781,14 +780,14 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
 
       const out = debug
         ? {
-            ...aiResult,
-            debug: {
-              used: "ai_only",
-              reason: "db_upgrade_failed_after_one_retry",
-              primary: { reason: primary.reason, meta: primary.meta },
-              cleaned_retry: { query: cleaned, reason: cleanedRetry.reason, meta: cleanedRetry.meta },
-            },
-          }
+          ...aiResult,
+          debug: {
+            used: "ai_only",
+            reason: "db_upgrade_failed_after_one_retry",
+            primary: { reason: primary.reason, meta: primary.meta },
+            cleaned_retry: { query: cleaned, reason: cleanedRetry.reason, meta: cleanedRetry.meta },
+          },
+        }
         : aiResult;
 
       if (!debug) cache.set(cacheKey, out);
