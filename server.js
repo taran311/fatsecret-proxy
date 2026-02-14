@@ -335,6 +335,12 @@ function round1(n) {
   return Number(x.toFixed(1));
 }
 
+// NEW: prevent 0 values being treated as “present”
+function toPositiveNumberOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 // -------------------- Build FatSecret candidates --------------------
 function buildCandidates(fsData) {
   const foods = fsData?.foods?.food || [];
@@ -497,15 +503,13 @@ Return JSON:
   const j = JSON.parse(response.output_text);
 
   // Prefer explicit ml from input if model left it blank
-  const ml = Number.isFinite(Number(j.ml)) ? Number(j.ml) : explicitMl;
+  const ml = toPositiveNumberOrNull(j.ml) ?? explicitMl;
 
   return {
     source: "ai",
     mode: ml ? "volume" : "serving",
     name: j.name,
-    grams: Number.isFinite(Number(j.estimated_serving_grams))
-      ? Number(j.estimated_serving_grams)
-      : null,
+    grams: toPositiveNumberOrNull(j.estimated_serving_grams),
     ml: ml ?? null,
     serving_description: j.serving_description,
     calories: Math.round(Number(j.calories) || 0),
