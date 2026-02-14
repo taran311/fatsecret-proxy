@@ -107,6 +107,14 @@ function asArray(x) {
   return Array.isArray(x) ? x : [];
 }
 
+function clamp01(n, fallback = 0.7) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(0, Math.min(1, x));
+}
+
+// ---- Explicit quantity parsing from user input ----
+
 // Only triggers if the user explicitly typed g/gram/grams
 function extractExplicitGrams(foodText) {
   const match = String(foodText).match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
@@ -115,19 +123,45 @@ function extractExplicitGrams(foodText) {
   return Number.isFinite(grams) ? grams : null;
 }
 
-function clamp01(n, fallback = 0.7) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return fallback;
-  return Math.max(0, Math.min(1, x));
+// Parses explicit ml/L in user input.
+// Supports: "330ml", "330 ml", "0.5l", "1L"
+function extractExplicitMl(foodText) {
+  const t = String(foodText);
+
+  // ml
+  let m = t.match(/(\d+(?:\.\d+)?)\s*ml\b/i);
+  if (m) {
+    const ml = Number(m[1]);
+    return Number.isFinite(ml) && ml > 0 ? ml : null;
+  }
+
+  // liters
+  m = t.match(/(\d+(?:\.\d+)?)\s*l\b/i);
+  if (m) {
+    const l = Number(m[1]);
+    const ml = l * 1000;
+    return Number.isFinite(ml) && ml > 0 ? ml : null;
+  }
+
+  return null;
 }
 
-// Extract "Per {N}g" base grams from FatSecret description
+// ---- Extract scaling bases from FatSecret descriptions ----
 // Examples:
-// "Per 100g - Calories: ..."
-// "Per 1152g - Calories: ..."
+// "Per 100g - ..."
+// "Per 1152g - ..."
+// "Per 100ml - ..."
 function extractPerGramsFromDescription(desc) {
   if (!desc) return null;
   const m = String(desc).match(/\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function extractPerMlFromDescription(desc) {
+  if (!desc) return null;
+  const m = String(desc).match(/\bPer\s+(\d+(?:\.\d+)?)\s*ml\b/i);
   if (!m) return null;
   const n = Number(m[1]);
   return Number.isFinite(n) && n > 0 ? n : null;
@@ -161,7 +195,8 @@ function buildFatSecretCandidates(fsData) {
       name: f.food_name,
       brand: f.brand_name || null,
       description,
-      per_grams: extractPerGramsFromDescription(description), // <-- NEW
+      per_grams: extractPerGramsFromDescription(description),
+      per_ml: extractPerMlFromDescription(description),
       type: f.food_type || null,
       url: f.food_url || null,
     };
@@ -227,7 +262,7 @@ Return JSON:
     };
   }
 
-  // Composite-friendly serving estimator (helps your “quick add” UX)
+  // Composite-friendly serving estimator
   const response = await openai.responses.create({
     model: "gpt-4.1-mini",
     temperature: 0.2,
@@ -239,7 +274,7 @@ Return JSON:
           "Return ONLY valid JSON.\n" +
           "- If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup), estimate nutrition for that portion.\n" +
           "- If the input contains multiple items (e.g. '2 eggs and toast'), estimate each mentally and return a single summed total.\n" +
-          "- If a UK brand/chain is mentioned (e.g. Greggs), use a conservative typical UK value if uncertain.\n" +
+          "- If a UK brand/chain is mentioned (e.g. Greggs, Costa), use a conservative typical UK value if uncertain.\n" +
           "- If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
       },
       {
@@ -293,13 +328,14 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     }
 
     const grams = extractExplicitGrams(food);
+    const ml = extractExplicitMl(food);
     const fsMax = Number.isFinite(Number(max_results)) ? Number(max_results) : 12;
 
     const cacheKey = `resolve:${food}:${fsMax}`;
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
-    // Composite inputs go straight to AI (avoids nonsense single-item DB picks)
+    // Composite inputs go straight to AI
     if (looksComposite(food)) {
       const fallback = await estimateWithGPT(food);
       if (debug) fallback.debug = { fallback_reason: "composite_input_detected" };
@@ -339,8 +375,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       return res.json(fallback);
     }
 
-    // 2) AI layer: select best match + compute totals robustly
-    // NEW: Scaling supports "Per {N}g" for any N, not just 100g.
+    // 2) AI selection layer (now supports Per {N}g and Per {N}ml)
     const selector = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0.1,
@@ -354,19 +389,17 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
             "- Choose the SINGLE best FatSecret candidate for the user's input.\n" +
             "- Use brand/name/description to match.\n" +
             "- If none are suitable, set use_fallback=true.\n\n" +
+            "IMPORTANT disambiguation rules:\n" +
+            "- If the user query implies a coffee shop drink size (small/medium/large) like 'Costa latte medium', prefer in-store drink entries.\n" +
+            "- Avoid at-home pod/capsule products (Tassimo, Nespresso, Dolce Gusto, K-Cup, pods/capsules) UNLESS the user explicitly mentions them.\n" +
+            "- Avoid 'baked', 'diet', 'zero', 'light', 'low fat' variants unless the user explicitly mentioned those words.\n\n" +
             "Candidate fields:\n" +
-            "- candidate.per_grams is a parsed number if description contains 'Per {N}g'.\n\n" +
-            "Nutrition extraction:\n" +
-            "- Prefer using numbers found in candidate.description.\n" +
-            "- Description examples:\n" +
-            '  "Per 100g - Calories: 165kcal | Fat: 3.6g | Carbs: 0g | Protein: 31g"\n' +
-            '  "Per 1152g - Calories: 1845kcal | Fat: 88.57g | Carbs: 84.63g | Protein: 177.07g"\n' +
-            '  "Per 1 bar - Calories: 240kcal | Fat: 9g | Carbs: 36g | Protein: 2g"\n\n' +
+            "- candidate.per_grams is present if description contains 'Per {N}g'.\n" +
+            "- candidate.per_ml is present if description contains 'Per {N}ml'.\n\n" +
             "SCALING RULES (IMPORTANT):\n" +
-            "- If user provided explicit grams AND candidate.per_grams is present (Per {N}g), scale all values by factor = explicit_grams / N.\n" +
-            "- Set mode='weight' only when you scaled using candidate.per_grams.\n" +
-            "- If description is per serving/bar/slice/portion (candidate.per_grams is null), DO NOT scale.\n" +
-            "- In that case set mode='serving' and return the per-serving values.\n\n" +
+            "- If user provided explicit grams AND candidate.per_grams is present, scale by factor = grams / per_grams and set mode='weight'.\n" +
+            "- If user provided explicit ml AND candidate.per_ml is present, scale by factor = ml / per_ml and set mode='volume'.\n" +
+            "- If description is per serving/bar/slice/pack/mug (no per_grams/per_ml), DO NOT scale; set mode='serving'.\n\n" +
             "Fallback rule:\n" +
             "- If you cannot reliably extract calories and at least 2 macros from description, set use_fallback=true.\n\n" +
             "Output must match the schema exactly. confidence is 0..1.",
@@ -377,13 +410,15 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
             {
               user_input: food,
               explicit_grams: grams,
+              explicit_ml: ml,
               candidates,
               schema: {
                 use_fallback: "boolean",
                 chosen_index: "number | null",
                 name: "string",
-                mode: '"weight" | "serving"',
+                mode: '"weight" | "volume" | "serving"',
                 grams: "number | null",
+                ml: "number | null",
                 calories: "number",
                 protein: "number",
                 carbs: "number",
@@ -440,9 +475,10 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
 
     const result = {
       source: "fatsecret",
-      mode: pick.mode || (grams ? "weight" : "serving"),
+      mode: pick.mode || (grams ? "weight" : ml ? "volume" : "serving"),
       name: pick.name || chosen.name,
       grams: pick.grams ?? grams ?? null,
+      ml: pick.ml ?? ml ?? null,
       calories: Math.round(Number(pick.calories) || 0),
       protein: Number((Number(pick.protein) || 0).toFixed(1)),
       carbs: Number((Number(pick.carbs) || 0).toFixed(1)),
@@ -458,9 +494,12 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
         chosen_name: chosen.name,
         chosen_description: chosen.description,
         chosen_per_grams: chosen.per_grams,
+        chosen_per_ml: chosen.per_ml,
         reason: pick.reason,
         candidate_count: candidates.length,
         threshold: FATSECRET_MIN_CONFIDENCE,
+        explicit_grams: grams,
+        explicit_ml: ml,
       };
     }
 
@@ -687,8 +726,6 @@ Return JSON ONLY with this shape:
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-
-  // Optional keep-alive ping (harmless)
   setInterval(() => {
     axios.get(`http://localhost:${PORT}/health`).catch(() => {});
   }, 5 * 60 * 1000);
