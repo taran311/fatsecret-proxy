@@ -121,18 +121,16 @@ function clamp01(n, fallback = 0.7) {
   return Math.max(0, Math.min(1, x));
 }
 
-function buildFatSecretCandidates(fsData) {
-  const foods = fsData?.foods?.food || [];
-  const arr = asArray(foods);
-
-  return arr.slice(0, 12).map((f) => ({
-    food_id: f.food_id,
-    name: f.food_name,
-    brand: f.brand_name || null,
-    description: f.food_description || null,
-    type: f.food_type || null,
-    url: f.food_url || null,
-  }));
+// Extract "Per {N}g" base grams from FatSecret description
+// Examples:
+// "Per 100g - Calories: ..."
+// "Per 1152g - Calories: ..."
+function extractPerGramsFromDescription(desc) {
+  if (!desc) return null;
+  const m = String(desc).match(/\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 // Detect “composite” multi-item inputs (e.g. "2 eggs and toast with butter").
@@ -150,6 +148,24 @@ function looksComposite(text) {
   if (qtyMatches && qtyMatches.length >= 2) return true;
 
   return false;
+}
+
+function buildFatSecretCandidates(fsData) {
+  const foods = fsData?.foods?.food || [];
+  const arr = asArray(foods);
+
+  return arr.slice(0, 12).map((f) => {
+    const description = f.food_description || null;
+    return {
+      food_id: f.food_id,
+      name: f.food_name,
+      brand: f.brand_name || null,
+      description,
+      per_grams: extractPerGramsFromDescription(description), // <-- NEW
+      type: f.food_type || null,
+      url: f.food_url || null,
+    };
+  });
 }
 
 // -------------------- Internal AI estimate (fallback + quick add) --------------------
@@ -211,6 +227,7 @@ Return JSON:
     };
   }
 
+  // Composite-friendly serving estimator (helps your “quick add” UX)
   const response = await openai.responses.create({
     model: "gpt-4.1-mini",
     temperature: 0.2,
@@ -219,7 +236,11 @@ Return JSON:
       {
         role: "system",
         content:
-          "Return ONLY valid JSON. If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup), estimate nutrition for that portion. If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
+          "Return ONLY valid JSON.\n" +
+          "- If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup), estimate nutrition for that portion.\n" +
+          "- If the input contains multiple items (e.g. '2 eggs and toast'), estimate each mentally and return a single summed total.\n" +
+          "- If a UK brand/chain is mentioned (e.g. Greggs), use a conservative typical UK value if uncertain.\n" +
+          "- If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
       },
       {
         role: "user",
@@ -278,7 +299,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
-    // NEW: Composite inputs go straight to AI (avoids nonsense single-item DB picks)
+    // Composite inputs go straight to AI (avoids nonsense single-item DB picks)
     if (looksComposite(food)) {
       const fallback = await estimateWithGPT(food);
       if (debug) fallback.debug = { fallback_reason: "composite_input_detected" };
@@ -318,8 +339,8 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       return res.json(fallback);
     }
 
-    // 2) AI layer: select best match + return ONE normalized card
-    // FIX: Only scale when candidate.description explicitly says "Per 100g".
+    // 2) AI layer: select best match + compute totals robustly
+    // NEW: Scaling supports "Per {N}g" for any N, not just 100g.
     const selector = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0.1,
@@ -333,17 +354,19 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
             "- Choose the SINGLE best FatSecret candidate for the user's input.\n" +
             "- Use brand/name/description to match.\n" +
             "- If none are suitable, set use_fallback=true.\n\n" +
+            "Candidate fields:\n" +
+            "- candidate.per_grams is a parsed number if description contains 'Per {N}g'.\n\n" +
             "Nutrition extraction:\n" +
             "- Prefer using numbers found in candidate.description.\n" +
-            "- candidate.description typically looks like:\n" +
+            "- Description examples:\n" +
             '  "Per 100g - Calories: 165kcal | Fat: 3.6g | Carbs: 0g | Protein: 31g"\n' +
-            '  OR "Per 1 bar - Calories: 240kcal | Fat: 9g | Carbs: 36g | Protein: 2g"\n\n' +
+            '  "Per 1152g - Calories: 1845kcal | Fat: 88.57g | Carbs: 84.63g | Protein: 177.07g"\n' +
+            '  "Per 1 bar - Calories: 240kcal | Fat: 9g | Carbs: 36g | Protein: 2g"\n\n' +
             "SCALING RULES (IMPORTANT):\n" +
-            "- ONLY scale by grams if the description explicitly says 'Per 100g'.\n" +
-            "- If description says 'Per 1 bar', 'Per serving', 'Per slice', etc., DO NOT scale.\n" +
-            "- If user provides grams but description is per-serving (not per-100g), return the per-serving values unchanged.\n" +
-            "- Set mode='weight' only when you are using a 'Per 100g' description and scaling by grams.\n" +
-            "- Otherwise set mode='serving'.\n\n" +
+            "- If user provided explicit grams AND candidate.per_grams is present (Per {N}g), scale all values by factor = explicit_grams / N.\n" +
+            "- Set mode='weight' only when you scaled using candidate.per_grams.\n" +
+            "- If description is per serving/bar/slice/portion (candidate.per_grams is null), DO NOT scale.\n" +
+            "- In that case set mode='serving' and return the per-serving values.\n\n" +
             "Fallback rule:\n" +
             "- If you cannot reliably extract calories and at least 2 macros from description, set use_fallback=true.\n\n" +
             "Output must match the schema exactly. confidence is 0..1.",
@@ -434,6 +457,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
         chosen_brand: chosen.brand,
         chosen_name: chosen.name,
         chosen_description: chosen.description,
+        chosen_per_grams: chosen.per_grams,
         reason: pick.reason,
         candidate_count: candidates.length,
         threshold: FATSECRET_MIN_CONFIDENCE,
@@ -573,7 +597,7 @@ app.post("/macro-targets", async (req, res) => {
       },
     };
 
-    // ---- AI verification (should NOT change numbers unless rules violated) ----
+    // ---- AI verification ----
     const aiResponse = await openai.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0,
@@ -627,7 +651,6 @@ Return JSON ONLY with this shape:
 
     let ai = safeJsonParse(aiResponse.output_text) || {};
 
-    // ---- Normalize / enforce rules in code ----
     ai.status = normalizeStatus(ai.status);
     ai.confidence = clampNumber(ai.confidence, 0, 1) ?? 0.75;
     ai.issues = Array.isArray(ai.issues) ? ai.issues : [];
