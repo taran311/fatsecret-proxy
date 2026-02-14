@@ -11,7 +11,7 @@ dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
-app.use(compression()); // Compress responses
+app.use(compression());
 
 // -------------------- CORS --------------------
 app.use(
@@ -33,58 +33,46 @@ app.use(
 );
 
 // -------------------- Clients --------------------
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // -------------------- FatSecret --------------------
 const FATSECRET_API_URL = "https://platform.fatsecret.com/rest/server.api";
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-// Cache resolve results for faster UX
-const cache = new NodeCache({ stdTTL: 600 }); // 10 minutes
-
-// Minimum confidence required to trust FatSecret match.
-// If the match confidence is below this, we fallback to AI estimate.
+const cache = new NodeCache({ stdTTL: 600 }); // 10 mins
 const FATSECRET_MIN_CONFIDENCE = 0.65;
 
 let accessToken = null;
 let tokenExpirationTime = null;
 
 const getAccessToken = async () => {
-  try {
-    console.log("Fetching new access token...");
-    const response = await axios.post(
-      "https://oauth.fatsecret.com/connect/token",
-      new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        scope: "basic",
-      }).toString(),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-    );
+  console.log("Fetching new access token...");
+  const response = await axios.post(
+    "https://oauth.fatsecret.com/connect/token",
+    new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      scope: "basic",
+    }).toString(),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
 
-    accessToken = response.data.access_token;
-    tokenExpirationTime = Date.now() + response.data.expires_in * 1000;
-    console.log("Access token fetched successfully");
-  } catch (err) {
-    console.error("Error fetching access token:", err.response?.data || err.message);
-    throw new Error("Failed to fetch access token");
-  }
+  accessToken = response.data.access_token;
+  tokenExpirationTime = Date.now() + response.data.expires_in * 1000;
+  console.log("Access token fetched successfully");
 };
 
 const ensureFatSecretToken = async (req, res, next) => {
   if (!CLIENT_ID || !CLIENT_SECRET) {
     return res.status(500).json({ error: "FatSecret CLIENT_ID/CLIENT_SECRET missing" });
   }
-
   if (!accessToken || Date.now() >= tokenExpirationTime) {
     try {
       await getAccessToken();
     } catch (err) {
-      console.error("Failed to refresh access token:", err.message);
+      console.error("Failed to refresh access token:", err.response?.data || err.message);
       return res.status(500).json({ error: "Failed to fetch access token" });
     }
   }
@@ -94,7 +82,7 @@ const ensureFatSecretToken = async (req, res, next) => {
 // -------------------- Health --------------------
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// -------------------- Small helpers --------------------
+// -------------------- Helpers --------------------
 function safeJsonParse(text) {
   try {
     return JSON.parse(text);
@@ -102,52 +90,46 @@ function safeJsonParse(text) {
     return null;
   }
 }
-
 function asArray(x) {
   return Array.isArray(x) ? x : [];
 }
-
 function clamp01(n, fallback = 0.7) {
   const x = Number(n);
   if (!Number.isFinite(x)) return fallback;
   return Math.max(0, Math.min(1, x));
 }
-
 function normText(s) {
   return String(s || "")
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
 }
-
 function includesAny(haystack, needles) {
   const h = normText(haystack);
   return needles.some((n) => h.includes(n));
 }
+function round1(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Number(x.toFixed(1));
+}
 
 // ---- Explicit quantity parsing from user input ----
-
-// Only triggers if the user explicitly typed g/gram/grams
 function extractExplicitGrams(foodText) {
   const match = String(foodText).match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
   if (!match) return null;
   const grams = Number(match[1]);
   return Number.isFinite(grams) ? grams : null;
 }
-
-// Parses explicit ml/L in user input.
-// Supports: "330ml", "330 ml", "0.5l", "1L"
 function extractExplicitMl(foodText) {
   const t = String(foodText);
 
-  // ml
   let m = t.match(/(\d+(?:\.\d+)?)\s*ml\b/i);
   if (m) {
     const ml = Number(m[1]);
     return Number.isFinite(ml) && ml > 0 ? ml : null;
   }
 
-  // liters
   m = t.match(/(\d+(?:\.\d+)?)\s*l\b/i);
   if (m) {
     const l = Number(m[1]);
@@ -158,7 +140,7 @@ function extractExplicitMl(foodText) {
   return null;
 }
 
-// ---- Extract scaling bases from FatSecret descriptions ----
+// ---- Extract scaling bases from FatSecret description ----
 function extractPerGramsFromDescription(desc) {
   if (!desc) return null;
   const m = String(desc).match(/\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i);
@@ -166,7 +148,6 @@ function extractPerGramsFromDescription(desc) {
   const n = Number(m[1]);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
-
 function extractPerMlFromDescription(desc) {
   if (!desc) return null;
   const m = String(desc).match(/\bPer\s+(\d+(?:\.\d+)?)\s*ml\b/i);
@@ -174,19 +155,15 @@ function extractPerMlFromDescription(desc) {
   const n = Number(m[1]);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
-
-// ---- Extract pack-size grams from candidate name (generic) ----
 function extractPackSizeGramsFromName(name) {
   const t = String(name || "");
 
-  // "(19.08g Bag)" / "(32.5g)"
   let m = t.match(/\((\d+(?:\.\d+)?)\s*g\b/i);
   if (m) {
     const g = Number(m[1]);
     return Number.isFinite(g) && g > 0 ? g : null;
   }
 
-  // "51g" anywhere
   m = t.match(/\b(\d+(?:\.\d+)?)\s*g\b/i);
   if (m) {
     const g = Number(m[1]);
@@ -194,6 +171,47 @@ function extractPackSizeGramsFromName(name) {
   }
 
   return null;
+}
+
+// ---- Parse macros from FatSecret description (so we NEVER trust the model’s math) ----
+// Expected patterns like:
+// "Per 100ml - Calories: 42kcal | Fat: 0.00g | Carbs: 10.60g | Protein: 0.00g"
+function parseNutritionFromDescription(desc) {
+  const d = String(desc || "");
+
+  const calMatch = d.match(/Calories:\s*([0-9]+(?:\.[0-9]+)?)\s*kcal/i);
+  const fatMatch = d.match(/Fat:\s*([0-9]+(?:\.[0-9]+)?)\s*g/i);
+  const carbsMatch = d.match(/Carbs:\s*([0-9]+(?:\.[0-9]+)?)\s*g/i);
+  const proteinMatch = d.match(/Protein:\s*([0-9]+(?:\.[0-9]+)?)\s*g/i);
+
+  const calories = calMatch ? Number(calMatch[1]) : null;
+  const fat = fatMatch ? Number(fatMatch[1]) : null;
+  const carbs = carbsMatch ? Number(carbsMatch[1]) : null;
+  const protein = proteinMatch ? Number(proteinMatch[1]) : null;
+
+  const ok =
+    Number.isFinite(calories) &&
+    Number.isFinite(fat) &&
+    Number.isFinite(carbs) &&
+    Number.isFinite(protein);
+
+  return ok ? { calories, fat, carbs, protein } : null;
+}
+
+function looksPerPackServing(desc) {
+  const d = normText(desc);
+  return (
+    d.includes("per 1 pack") ||
+    d.includes("per 1 bag") ||
+    d.includes("per pack") ||
+    d.includes("per bag") ||
+    d.includes("per 1 bar") ||
+    d.includes("per bar") ||
+    d.includes("per 1 serving") ||
+    d.includes("per serving") ||
+    d.includes("per 1 mug") ||
+    d.includes("per mug")
+  );
 }
 
 function looksComposite(text) {
@@ -223,6 +241,7 @@ function buildFatSecretCandidates(fsData) {
       per_grams: extractPerGramsFromDescription(description),
       per_ml: extractPerMlFromDescription(description),
       pack_grams: extractPackSizeGramsFromName(name),
+      nutrition: parseNutritionFromDescription(description),
       type: f.food_type || null,
       url: f.food_url || null,
     };
@@ -262,70 +281,44 @@ const TOKENS = {
 function candidateText(c) {
   return `${c?.brand || ""} ${c?.name || ""} ${c?.description || ""}`;
 }
-
 function userImpliesInStoreDrink(userText) {
   return includesAny(userText, TOKENS.drinkSizes);
 }
-
 function candidateLooksCapsuleProduct(c) {
   return includesAny(candidateText(c), TOKENS.capsule);
 }
-
 function userAsksForVariant(userText) {
   return includesAny(userText, TOKENS.variants);
 }
-
 function candidateIsVariant(c) {
   return includesAny(candidateText(c), TOKENS.variants);
 }
-
 function packSizeMismatch(userGrams, candidatePackGrams) {
   if (!Number.isFinite(Number(userGrams)) || !Number.isFinite(Number(candidatePackGrams)))
     return false;
-
   const u = Number(userGrams);
   const p = Number(candidatePackGrams);
   if (u <= 0 || p <= 0) return false;
-
-  const rel = Math.abs(p - u) / u;
-  return rel > 0.2; // >20% mismatch
+  return Math.abs(p - u) / u > 0.2;
 }
 
-function looksPerPackServing(desc) {
-  const d = normText(desc);
-  // high-signal serving terms (avoid overfitting)
-  return (
-    d.includes("per 1 pack") ||
-    d.includes("per 1 bag") ||
-    d.includes("per pack") ||
-    d.includes("per bag") ||
-    d.includes("per 1 bar") ||
-    d.includes("per bar") ||
-    d.includes("per 1 serving") ||
-    d.includes("per serving") ||
-    d.includes("per 1 mug") ||
-    d.includes("per mug")
-  );
-}
-
-/**
- * NEW POLICY: "explicit grams requires scalable nutrition"
- *
- * If user explicitly typed grams, we should NOT accept a DB item that is "per pack/bag"
- * unless we can safely scale (per_grams) OR the pack size matches.
- *
- * Otherwise: mismatch -> retry/fallback to AI.
- */
+// NEW POLICY: explicit grams requires scalable nutrition OR confirm pack size
 function cannotSafelyUseForExplicitGrams(candidate, explicitGrams) {
   if (explicitGrams === null) return false;
 
-  // If we can scale by Per Ng, it's safe.
-  if (candidate?.per_grams) return false;
+  // If we have "Per Ng" we can scale safely.
+  if (candidate?.per_grams && candidate?.nutrition) return false;
 
-  // If candidate has explicit pack grams and it's close, it's safe.
-  if (candidate?.pack_grams && !packSizeMismatch(explicitGrams, candidate.pack_grams)) return false;
+  // If it’s explicitly a pack size and close match, accept (and we can optionally scale by pack_grams).
+  if (
+    candidate?.pack_grams &&
+    candidate?.nutrition &&
+    !packSizeMismatch(explicitGrams, candidate.pack_grams)
+  ) {
+    return false;
+  }
 
-  // If candidate is per-pack/bag/serving style and we cannot scale/confirm pack grams -> unsafe.
+  // If it’s per pack/bag/serving and we cannot scale/confirm -> unsafe
   if (looksPerPackServing(candidate?.description || "")) return true;
 
   return false;
@@ -335,7 +328,7 @@ function computeMismatch(userText, chosenCandidate, { explicitGrams }) {
   const mismatches = [];
 
   if (userImpliesInStoreDrink(userText) && candidateLooksCapsuleProduct(chosenCandidate)) {
-    mismatches.push("product_type_mismatch_drink_format");
+    mismatches.push("product_type_mismatch");
   }
 
   if (!userAsksForVariant(userText) && candidateIsVariant(chosenCandidate)) {
@@ -350,9 +343,13 @@ function computeMismatch(userText, chosenCandidate, { explicitGrams }) {
     mismatches.push("explicit_weight_vs_pack_size_mismatch");
   }
 
-  // NEW: explicit grams but per-pack entry cannot be safely scaled
   if (cannotSafelyUseForExplicitGrams(chosenCandidate, explicitGrams)) {
     mismatches.push("explicit_weight_requires_scalable_source");
+  }
+
+  // If FatSecret candidate doesn’t even have parsable macros, veto.
+  if (!chosenCandidate?.nutrition) {
+    mismatches.push("unparseable_fatsecret_description");
   }
 
   return mismatches;
@@ -362,14 +359,12 @@ function filterCandidatesByMismatches(candidates, userText, mismatches, { explic
   if (!mismatches.length) return candidates;
 
   return candidates.filter((c) => {
-    if (mismatches.includes("product_type_mismatch_drink_format")) {
+    if (mismatches.includes("product_type_mismatch")) {
       if (candidateLooksCapsuleProduct(c)) return false;
     }
-
     if (mismatches.includes("variant_mismatch_user_unspecified")) {
       if (candidateIsVariant(c)) return false;
     }
-
     if (mismatches.includes("explicit_weight_vs_pack_size_mismatch")) {
       if (
         explicitGrams !== null &&
@@ -379,24 +374,22 @@ function filterCandidatesByMismatches(candidates, userText, mismatches, { explic
         return false;
       }
     }
-
     if (mismatches.includes("explicit_weight_requires_scalable_source")) {
-      // Remove candidates that are unsafe for explicit grams
       if (cannotSafelyUseForExplicitGrams(c, explicitGrams)) return false;
     }
-
+    if (mismatches.includes("unparseable_fatsecret_description")) {
+      if (!c?.nutrition) return false;
+    }
     return true;
   });
 }
 
-// -------------------- Internal AI estimate (fallback + quick add) --------------------
+// -------------------- AI estimate (fallback) --------------------
 async function estimateWithGPT(food) {
   const grams = extractExplicitGrams(food);
   const isWeightBased = grams !== null;
 
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is not set");
-  }
+  if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
 
   if (isWeightBased) {
     const response = await openai.responses.create({
@@ -436,10 +429,11 @@ Return JSON:
       mode: "weight",
       name: per100g.name,
       grams,
+      ml: null,
       calories: Math.round(Number(per100g.calories_per_100g) * factor),
-      protein: Number((Number(per100g.protein_per_100g) * factor).toFixed(1)),
-      carbs: Number((Number(per100g.carbs_per_100g) * factor).toFixed(1)),
-      fat: Number((Number(per100g.fat_per_100g) * factor).toFixed(1)),
+      protein: round1(Number(per100g.protein_per_100g) * factor),
+      carbs: round1(Number(per100g.carbs_per_100g) * factor),
+      fat: round1(Number(per100g.fat_per_100g) * factor),
       confidence: clamp01(per100g.confidence, 0.75),
       calories_per_100g: Number(per100g.calories_per_100g),
       protein_per_100g: Number(per100g.protein_per_100g),
@@ -491,17 +485,18 @@ Return JSON:
     grams: Number.isFinite(Number(out.estimated_serving_grams))
       ? Number(out.estimated_serving_grams)
       : null,
+    ml: null,
     serving_description: out.serving_description,
     calories: Math.round(Number(out.calories) || 0),
-    protein: Number((Number(out.protein) || 0).toFixed(1)),
-    carbs: Number((Number(out.carbs) || 0).toFixed(1)),
-    fat: Number((Number(out.fat) || 0).toFixed(1)),
+    protein: round1(Number(out.protein) || 0),
+    carbs: round1(Number(out.carbs) || 0),
+    fat: round1(Number(out.fat) || 0),
     confidence: clamp01(out.confidence, 0.7),
   };
 }
 
-// -------------------- AI selector --------------------
-async function selectFromCandidates({ food, grams, ml, candidates }) {
+// -------------------- AI selector (ONLY chooses candidate; code computes nutrition) --------------------
+async function selectCandidateIndex({ food, candidates }) {
   const selector = await openai.responses.create({
     model: "gpt-4.1-mini",
     temperature: 0.1,
@@ -510,42 +505,30 @@ async function selectFromCandidates({ food, grams, ml, candidates }) {
       {
         role: "system",
         content:
-          "Return ONLY valid JSON.\n\n" +
-          "Task:\n" +
-          "- Choose the SINGLE best FatSecret candidate for the user's input.\n" +
-          "- Use brand/name/description to match.\n" +
-          "- If none are suitable, set use_fallback=true.\n\n" +
-          "Candidate fields:\n" +
-          "- candidate.per_grams is present if description contains 'Per {N}g'.\n" +
-          "- candidate.per_ml is present if description contains 'Per {N}ml'.\n" +
-          "- candidate.pack_grams may be present if candidate name includes an explicit pack size.\n\n" +
-          "SCALING RULES:\n" +
-          "- If user provided grams AND candidate.per_grams is present, scale by factor = grams / per_grams and set mode='weight'.\n" +
-          "- If user provided ml AND candidate.per_ml is present, scale by factor = ml / per_ml and set mode='volume'.\n" +
-          "- If description is per serving/bar/slice/pack/mug (no per_grams/per_ml), DO NOT scale; set mode='serving'.\n\n" +
-          "Fallback rule:\n" +
-          "- If you cannot reliably extract calories and at least 2 macros from description, set use_fallback=true.\n\n" +
-          "Output must match the schema exactly. confidence is 0..1.",
+          "Return ONLY valid JSON.\n" +
+          "Pick the SINGLE best FatSecret candidate index for the user input.\n" +
+          "Do not do any nutrition math.\n" +
+          "If none fit, set use_fallback=true.\n" +
+          "Confidence must be 0..1.\n",
       },
       {
         role: "user",
         content: JSON.stringify(
           {
             user_input: food,
-            explicit_grams: grams,
-            explicit_ml: ml,
-            candidates,
+            candidates: candidates.map((c, i) => ({
+              i,
+              brand: c.brand,
+              name: c.name,
+              description: c.description,
+              per_grams: c.per_grams,
+              per_ml: c.per_ml,
+              pack_grams: c.pack_grams,
+              has_parsed_nutrition: Boolean(c.nutrition),
+            })),
             schema: {
               use_fallback: "boolean",
               chosen_index: "number | null",
-              name: "string",
-              mode: '"weight" | "volume" | "serving"',
-              grams: "number | null",
-              ml: "number | null",
-              calories: "number",
-              protein: "number",
-              carbs: "number",
-              fat: "number",
               confidence: "number",
               reason: "string",
             },
@@ -560,17 +543,125 @@ async function selectFromCandidates({ food, grams, ml, candidates }) {
   return safeJsonParse(selector.output_text);
 }
 
+// -------------------- Deterministic scaling (fixes your 10x Coke bug permanently) --------------------
+function computeFromCandidate({ candidate, explicitGrams, explicitMl }) {
+  const n = candidate?.nutrition;
+  if (!n) return null;
+
+  // Base quantity in description (Per Ng / Per Nml)
+  const perG = candidate?.per_grams ?? null;
+  const perMl = candidate?.per_ml ?? null;
+
+  // If user provided ML and candidate provides per_ml -> volume scaling
+  if (explicitMl !== null && perMl) {
+    const factor = explicitMl / perMl; // <-- correct, no /10 nonsense
+    return {
+      mode: "volume",
+      grams: null,
+      ml: explicitMl,
+      calories: Math.round(n.calories * factor),
+      protein: round1(n.protein * factor),
+      carbs: round1(n.carbs * factor),
+      fat: round1(n.fat * factor),
+      base_per_ml: perMl,
+      base_per_grams: null,
+      factor,
+    };
+  }
+
+  // If user provided grams and candidate provides per_grams -> weight scaling
+  if (explicitGrams !== null && perG) {
+    const factor = explicitGrams / perG;
+    return {
+      mode: "weight",
+      grams: explicitGrams,
+      ml: null,
+      calories: Math.round(n.calories * factor),
+      protein: round1(n.protein * factor),
+      carbs: round1(n.carbs * factor),
+      fat: round1(n.fat * factor),
+      base_per_ml: null,
+      base_per_grams: perG,
+      factor,
+    };
+  }
+
+  // If user provided grams but candidate is per-pack and we have pack_grams close => optionally scale by grams/pack_grams
+  if (
+    explicitGrams !== null &&
+    candidate?.pack_grams &&
+    !packSizeMismatch(explicitGrams, candidate.pack_grams) &&
+    looksPerPackServing(candidate?.description || "")
+  ) {
+    const factor = explicitGrams / candidate.pack_grams;
+    return {
+      mode: "weight",
+      grams: explicitGrams,
+      ml: null,
+      calories: Math.round(n.calories * factor),
+      protein: round1(n.protein * factor),
+      carbs: round1(n.carbs * factor),
+      fat: round1(n.fat * factor),
+      base_per_ml: null,
+      base_per_grams: candidate.pack_grams,
+      factor,
+    };
+  }
+
+  // Otherwise treat as serving (no scaling)
+  return {
+    mode: "serving",
+    grams: explicitGrams ?? null,
+    ml: explicitMl ?? null,
+    calories: Math.round(n.calories),
+    protein: round1(n.protein),
+    carbs: round1(n.carbs),
+    fat: round1(n.fat),
+    base_per_ml: perMl,
+    base_per_grams: perG,
+    factor: 1,
+  };
+}
+
+// -------------------- OPTIONAL: keep your FatSecret passthrough search --------------------
+app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
+  const { search_expression, max_results, format } = req.query;
+  const cacheKey = `fssearch:${search_expression}-${max_results}-${format || "json"}`;
+
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const response = await axios.get(FATSECRET_API_URL, {
+      params: {
+        method: "foods.search",
+        search_expression,
+        max_results,
+        format: format || "json",
+      },
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    cache.set(cacheKey, response.data);
+    return res.json(response.data);
+  } catch (err) {
+    console.error("foods.search error:", err.response?.data || err.message);
+    return res
+      .status(err.response?.status || 500)
+      .json(err.response?.data || { error: "Internal Server Error" });
+  }
+});
+
 // -------------------- SINGLE ENDPOINT: Hybrid resolve --------------------
 app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
   try {
     const { food, max_results, debug } = req.body || {};
 
-    if (!food || typeof food !== "string") {
-      return res.status(400).json({ error: "food is required" });
-    }
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
-    }
+    if (!food || typeof food !== "string") return res.status(400).json({ error: "food is required" });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
 
     const grams = extractExplicitGrams(food);
     const ml = extractExplicitMl(food);
@@ -580,7 +671,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
-    // Composite inputs go straight to AI
+    // Composite => AI directly
     if (looksComposite(food)) {
       const fallback = await estimateWithGPT(food);
       if (debug) fallback.debug = { fallback_reason: "composite_input_detected" };
@@ -589,7 +680,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     }
 
     // 1) FatSecret search
-    let fsData = null;
+    let fsData;
     try {
       const fsResp = await axios.get(FATSECRET_API_URL, {
         params: {
@@ -605,33 +696,30 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       });
       fsData = fsResp.data;
     } catch (err) {
-      console.error("FatSecret search failed, falling back:", err?.response?.data || err.message);
+      console.error("FatSecret search failed:", err?.response?.data || err.message);
       const fallback = await estimateWithGPT(food);
+      if (debug) fallback.debug = { fallback_reason: "fatsecret_search_failed" };
       cache.set(cacheKey, fallback);
       return res.json(fallback);
     }
 
     const candidates = buildFatSecretCandidates(fsData);
-
     if (!candidates.length) {
       const fallback = await estimateWithGPT(food);
+      if (debug) fallback.debug = { fallback_reason: "no_candidates" };
       cache.set(cacheKey, fallback);
       return res.json(fallback);
     }
 
-    // 2) Select best candidate with AI
-    let pick = await selectFromCandidates({ food, grams, ml, candidates });
-    let modelConfidence = clamp01(pick?.confidence, 0);
+    // 2) AI pick candidate index (NO math)
+    const pick = await selectCandidateIndex({ food, candidates });
+    const modelConfidence = clamp01(pick?.confidence, 0);
 
     const shouldFallbackInitial =
-      !pick ||
-      pick.use_fallback ||
-      pick.chosen_index === null ||
-      modelConfidence < FATSECRET_MIN_CONFIDENCE;
+      !pick || pick.use_fallback || pick.chosen_index === null || modelConfidence < FATSECRET_MIN_CONFIDENCE;
 
     if (shouldFallbackInitial) {
       const fallback = await estimateWithGPT(food);
-
       if (debug) {
         fallback.debug = {
           fallback_reason:
@@ -647,7 +735,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           candidate_count: candidates.length,
         };
       }
-
       cache.set(cacheKey, fallback);
       return res.json(fallback);
     }
@@ -655,44 +742,35 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     let chosen = candidates[pick.chosen_index];
     if (!chosen) {
       const fallback = await estimateWithGPT(food);
+      if (debug) fallback.debug = { fallback_reason: "chosen_index_out_of_range" };
       cache.set(cacheKey, fallback);
       return res.json(fallback);
     }
 
-    // 3) Generic mismatch guardrail: if mismatch, retry with filtered candidates ONCE,
-    // and if still no good DB candidate, fallback to AI (great UX)
+    // 3) mismatch guardrails + retry once
     const mismatches = computeMismatch(food, chosen, { explicitGrams: grams });
     let didRetry = false;
+    let usedFiltered = false;
 
     if (mismatches.length) {
-      const filtered = filterCandidatesByMismatches(candidates, food, mismatches, {
-        explicitGrams: grams,
-      });
-
+      const filtered = filterCandidatesByMismatches(candidates, food, mismatches, { explicitGrams: grams });
       if (filtered.length && filtered.length !== candidates.length) {
         didRetry = true;
+        usedFiltered = true;
 
-        const retryPick = await selectFromCandidates({ food, grams, ml, candidates: filtered });
-        const retryConfidence = clamp01(retryPick?.confidence, 0);
+        const retryPick = await selectCandidateIndex({ food, candidates: filtered });
+        const retryConf = clamp01(retryPick?.confidence, 0);
 
-        if (
-          retryPick &&
-          !retryPick.use_fallback &&
-          retryPick.chosen_index !== null &&
-          retryConfidence >= FATSECRET_MIN_CONFIDENCE
-        ) {
-          pick = retryPick;
-          modelConfidence = retryConfidence;
+        if (retryPick && !retryPick.use_fallback && retryPick.chosen_index !== null && retryConf >= FATSECRET_MIN_CONFIDENCE) {
           chosen = filtered[retryPick.chosen_index] || chosen;
 
-          // If even after retry the chosen candidate still fails "explicit grams must be scalable",
-          // go straight to AI fallback.
-          if (cannotSafelyUseForExplicitGrams(chosen, grams)) {
+          const mism2 = computeMismatch(food, chosen, { explicitGrams: grams });
+          if (mism2.length) {
             const fallback = await estimateWithGPT(food);
             if (debug) {
               fallback.debug = {
-                fallback_reason: "explicit_grams_requires_scalable_source_fallback",
-                mismatches: [...mismatches, "explicit_weight_requires_scalable_source"],
+                fallback_reason: "mismatch_after_retry",
+                mismatches: mism2,
                 threshold: FATSECRET_MIN_CONFIDENCE,
                 candidate_count: candidates.length,
                 filtered_candidate_count: filtered.length,
@@ -722,7 +800,6 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           fallback.debug = {
             fallback_reason: "mismatch_veto_no_filter_possible",
             mismatches,
-            model_confidence: modelConfidence,
             threshold: FATSECRET_MIN_CONFIDENCE,
             candidate_count: candidates.length,
           };
@@ -732,16 +809,30 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       }
     }
 
+    // 4) Deterministic compute nutrition (fixes Coke 10x bug)
+    const computed = computeFromCandidate({ candidate: chosen, explicitGrams: grams, explicitMl: ml });
+    if (!computed) {
+      const fallback = await estimateWithGPT(food);
+      if (debug) {
+        fallback.debug = {
+          fallback_reason: "fatsecret_unparseable_nutrition",
+          candidate_count: candidates.length,
+        };
+      }
+      cache.set(cacheKey, fallback);
+      return res.json(fallback);
+    }
+
     const result = {
       source: "fatsecret",
-      mode: pick.mode || (grams ? "weight" : ml ? "volume" : "serving"),
-      name: pick.name || chosen.name,
-      grams: pick.grams ?? grams ?? null,
-      ml: pick.ml ?? ml ?? null,
-      calories: Math.round(Number(pick.calories) || 0),
-      protein: Number((Number(pick.protein) || 0).toFixed(1)),
-      carbs: Number((Number(pick.carbs) || 0).toFixed(1)),
-      fat: Number((Number(pick.fat) || 0).toFixed(1)),
+      mode: computed.mode,
+      name: chosen.brand ? `${chosen.brand} ${chosen.name}` : chosen.name,
+      grams: computed.grams,
+      ml: computed.ml,
+      calories: computed.calories,
+      protein: computed.protein,
+      carbs: computed.carbs,
+      fat: computed.fat,
       confidence: modelConfidence,
     };
 
@@ -755,13 +846,17 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
         chosen_per_grams: chosen.per_grams,
         chosen_per_ml: chosen.per_ml,
         chosen_pack_grams: chosen.pack_grams,
+        parsed_nutrition: chosen.nutrition,
+        computed_factor: computed.factor,
+        computed_base_per_grams: computed.base_per_grams,
+        computed_base_per_ml: computed.base_per_ml,
         reason: pick.reason,
         candidate_count: candidates.length,
         threshold: FATSECRET_MIN_CONFIDENCE,
         explicit_grams: grams,
         explicit_ml: ml,
-        mismatches_detected: mismatches,
         mismatch_retry_performed: didRetry,
+        mismatch_retry_used_filtered: usedFiltered,
       };
     }
 
@@ -779,6 +874,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     } catch {
       // ignore
     }
+
     return res.status(500).json({ error: "Resolve failed" });
   }
 });
@@ -790,13 +886,7 @@ function activityFactor(exerciseLevel) {
   if (key === "1-3 hours per week") return 1.375;
   if (key === "4-6 hours per week") return 1.55;
   if (key === "7-9 hours per week") return 1.725;
-  if (
-    key === "10 hour+ per week" ||
-    key === "10 hours+ per week" ||
-    key === "10+ hours per week"
-  )
-    return 1.9;
-
+  if (key === "10 hour+ per week" || key === "10 hours+ per week" || key === "10+ hours per week") return 1.9;
   return 1.2;
 }
 
@@ -805,7 +895,7 @@ function bmrMifflin({ gender, weightKg, heightCm, age }) {
   const base = 10 * weightKg + 6.25 * heightCm - 5 * age;
   if (g === "male" || g === "m") return base + 5;
   if (g === "female" || g === "f") return base - 161;
-  return base - 78; // neutral-ish fallback
+  return base - 78;
 }
 
 function buildMacros({ calories, weightKg, protein_g_per_kg, fat_pct }) {
@@ -875,24 +965,9 @@ app.post("/macro-targets", async (req, res) => {
       bmr,
       tdee,
       targets: {
-        lose: buildMacros({
-          calories: loseCalories,
-          weightKg,
-          protein_g_per_kg: 2.0,
-          fat_pct: 0.25,
-        }),
-        maintain: buildMacros({
-          calories: maintainCalories,
-          weightKg,
-          protein_g_per_kg: 1.8,
-          fat_pct: 0.27,
-        }),
-        gain: buildMacros({
-          calories: gainCalories,
-          weightKg,
-          protein_g_per_kg: 1.8,
-          fat_pct: 0.22,
-        }),
+        lose: buildMacros({ calories: loseCalories, weightKg, protein_g_per_kg: 2.0, fat_pct: 0.25 }),
+        maintain: buildMacros({ calories: maintainCalories, weightKg, protein_g_per_kg: 1.8, fat_pct: 0.27 }),
+        gain: buildMacros({ calories: gainCalories, weightKg, protein_g_per_kg: 1.8, fat_pct: 0.22 }),
       },
     };
 
@@ -970,11 +1045,7 @@ Return JSON ONLY with this shape:
       if (!ai.final || !ai.final.targets) ai.final = baselineFinal;
     }
 
-    return res.json({
-      mode: "verified_by_ai",
-      baseline,
-      ai,
-    });
+    return res.json({ mode: "verified_by_ai", baseline, ai });
   } catch (err) {
     console.error("Macro targets error:", err?.response?.data || err.message || err);
     return res.status(500).json({ error: "Failed to calculate macro targets" });
