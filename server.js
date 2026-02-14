@@ -42,7 +42,12 @@ const FATSECRET_API_URL = "https://platform.fatsecret.com/rest/server.api";
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-const cache = new NodeCache({ stdTTL: 300 }); // 5 minutes
+// Cache resolve results for faster UX
+const cache = new NodeCache({ stdTTL: 600 }); // 10 minutes
+
+// Minimum confidence required to trust FatSecret match.
+// If the match confidence is below this, we fallback to AI estimate.
+const FATSECRET_MIN_CONFIDENCE = 0.65;
 
 let accessToken = null;
 let tokenExpirationTime = null;
@@ -71,6 +76,10 @@ const getAccessToken = async () => {
 };
 
 const ensureFatSecretToken = async (req, res, next) => {
+  if (!CLIENT_ID || !CLIENT_SECRET) {
+    return res.status(500).json({ error: "FatSecret CLIENT_ID/CLIENT_SECRET missing" });
+  }
+
   if (!accessToken || Date.now() >= tokenExpirationTime) {
     try {
       await getAccessToken();
@@ -85,107 +94,70 @@ const ensureFatSecretToken = async (req, res, next) => {
 // -------------------- Health --------------------
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// -------------------- FatSecret foods.search --------------------
-app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
-  const { search_expression, max_results, format } = req.query;
-  const cacheKey = `${search_expression}-${max_results}-${format}`;
-
-  const cachedData = cache.get(cacheKey);
-  if (cachedData) {
-    console.log("Serving data from cache:", cacheKey);
-    return res.json(cachedData);
-  }
-
+// -------------------- Small helpers --------------------
+function safeJsonParse(text) {
   try {
-    const response = await axios.get(FATSECRET_API_URL, {
-      params: {
-        method: "foods.search",
-        search_expression,
-        max_results,
-        format,
-      },
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-    });
-
-    cache.set(cacheKey, response.data);
-    return res.json(response.data);
-  } catch (err) {
-    console.error("Error forwarding request:", err.response?.data || err.message);
-
-    if (err.response?.status === 401) {
-      console.log("Access token expired. Refreshing...");
-      try {
-        await getAccessToken();
-        const retryResponse = await axios.get(FATSECRET_API_URL, {
-          params: {
-            method: "foods.search",
-            search_expression,
-            max_results,
-            format,
-          },
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
-        });
-
-        cache.set(cacheKey, retryResponse.data);
-        return res.json(retryResponse.data);
-      } catch (retryError) {
-        console.error("Failed after refreshing token:", retryError.message);
-        return res.status(500).json({
-          error: "Failed to retry request after refreshing token",
-        });
-      }
-    }
-
-    return res
-      .status(err.response?.status || 500)
-      .json(err.response?.data || { error: "Internal Server Error" });
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
-});
+}
 
-// -------------------- Estimate helpers --------------------
+function asArray(x) {
+  return Array.isArray(x) ? x : [];
+}
+
+// Only triggers if the user explicitly typed g/gram/grams
 function extractExplicitGrams(foodText) {
-  // Only triggers if the user explicitly typed g/gram/grams
   const match = String(foodText).match(/(\d+(?:\.\d+)?)\s*(g|gram|grams)\b/i);
   if (!match) return null;
   const grams = Number(match[1]);
   return Number.isFinite(grams) ? grams : null;
 }
 
-// -------------------- GPT: /estimate --------------------
-app.post("/estimate", async (req, res) => {
-  try {
-    const { food } = req.body;
+function clamp01(n, fallback = 0.7) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(0, Math.min(1, x));
+}
 
-    if (!food || typeof food !== "string") {
-      return res.status(400).json({ error: "food is required" });
-    }
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
-    }
+function buildFatSecretCandidates(fsData) {
+  const foods = fsData?.foods?.food || [];
+  const arr = asArray(foods);
 
-    const grams = extractExplicitGrams(food);
-    const isWeightBased = grams !== null;
+  return arr.slice(0, 12).map((f) => ({
+    food_id: f.food_id,
+    name: f.food_name,
+    brand: f.brand_name || null,
+    description: f.food_description || null,
+    type: f.food_type || null,
+    url: f.food_url || null,
+  }));
+}
 
-    if (isWeightBased) {
-      const response = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        temperature: 0.2,
-        text: { format: { type: "json_object" } },
-        input: [
-          {
-            role: "system",
-            content:
-              "Return ONLY valid JSON. Always return values strictly PER 100g for the described food. Do NOT scale totals to any quantity mentioned.",
-          },
-          {
-            role: "user",
-            content: `Food description: "${food}"
+// -------------------- Internal AI estimate (fallback + quick add) --------------------
+async function estimateWithGPT(food) {
+  const grams = extractExplicitGrams(food);
+  const isWeightBased = grams !== null;
+
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is not set");
+  }
+
+  if (isWeightBased) {
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      text: { format: { type: "json_object" } },
+      input: [
+        {
+          role: "system",
+          content:
+            "Return ONLY valid JSON. Always return values strictly PER 100g for the described food. Do NOT scale totals to any quantity mentioned.",
+        },
+        {
+          role: "user",
+          content: `Food description: "${food}"
 
 Return JSON:
 {
@@ -196,37 +168,45 @@ Return JSON:
   "fat_per_100g": number,
   "confidence": number
 }`,
-          },
-        ],
-      });
-
-      const per100g = JSON.parse(response.output_text);
-      const factor = grams / 100;
-
-      return res.json({
-        mode: "weight",
-        ...per100g,
-        grams,
-        calories: Math.round(Number(per100g.calories_per_100g) * factor),
-        protein: Number((Number(per100g.protein_per_100g) * factor).toFixed(1)),
-        carbs: Number((Number(per100g.carbs_per_100g) * factor).toFixed(1)),
-        fat: Number((Number(per100g.fat_per_100g) * factor).toFixed(1)),
-      });
-    }
-
-    const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      temperature: 0.2,
-      text: { format: { type: "json_object" } },
-      input: [
-        {
-          role: "system",
-          content:
-            "Return ONLY valid JSON. If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup), estimate nutrition for that portion. If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
         },
-        {
-          role: "user",
-          content: `Food description: "${food}"
+      ],
+    });
+
+    const per100g = safeJsonParse(response.output_text);
+    if (!per100g) throw new Error("Bad JSON from model (weight)");
+
+    const factor = grams / 100;
+
+    return {
+      source: "ai",
+      mode: "weight",
+      name: per100g.name,
+      grams,
+      calories: Math.round(Number(per100g.calories_per_100g) * factor),
+      protein: Number((Number(per100g.protein_per_100g) * factor).toFixed(1)),
+      carbs: Number((Number(per100g.carbs_per_100g) * factor).toFixed(1)),
+      fat: Number((Number(per100g.fat_per_100g) * factor).toFixed(1)),
+      confidence: clamp01(per100g.confidence, 0.75),
+      calories_per_100g: Number(per100g.calories_per_100g),
+      protein_per_100g: Number(per100g.protein_per_100g),
+      carbs_per_100g: Number(per100g.carbs_per_100g),
+      fat_per_100g: Number(per100g.fat_per_100g),
+    };
+  }
+
+  const response = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    temperature: 0.2,
+    text: { format: { type: "json_object" } },
+    input: [
+      {
+        role: "system",
+        content:
+          "Return ONLY valid JSON. If the user specifies a portion (e.g. 1 slice, 1 tbsp, 1 cup), estimate nutrition for that portion. If no portion is specified, assume a typical single serving. Be realistic for UK portions.",
+      },
+      {
+        role: "user",
+        content: `Food description: "${food}"
 
 Return JSON:
 {
@@ -239,17 +219,214 @@ Return JSON:
   "fat": number,
   "confidence": number
 }`,
+      },
+    ],
+  });
+
+  const out = safeJsonParse(response.output_text);
+  if (!out) throw new Error("Bad JSON from model (serving)");
+
+  return {
+    source: "ai",
+    mode: "serving",
+    name: out.name,
+    grams: Number.isFinite(Number(out.estimated_serving_grams))
+      ? Number(out.estimated_serving_grams)
+      : null,
+    serving_description: out.serving_description,
+    calories: Math.round(Number(out.calories) || 0),
+    protein: Number((Number(out.protein) || 0).toFixed(1)),
+    carbs: Number((Number(out.carbs) || 0).toFixed(1)),
+    fat: Number((Number(out.fat) || 0).toFixed(1)),
+    confidence: clamp01(out.confidence, 0.7),
+  };
+}
+
+// -------------------- SINGLE ENDPOINT: Hybrid resolve --------------------
+app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
+  try {
+    const { food, max_results, debug } = req.body || {};
+
+    if (!food || typeof food !== "string") {
+      return res.status(400).json({ error: "food is required" });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
+    }
+
+    const grams = extractExplicitGrams(food);
+    const fsMax = Number.isFinite(Number(max_results)) ? Number(max_results) : 12;
+
+    const cacheKey = `resolve:${food}:${fsMax}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    // 1) FatSecret search
+    let fsData = null;
+    try {
+      const fsResp = await axios.get(FATSECRET_API_URL, {
+        params: {
+          method: "foods.search",
+          search_expression: food,
+          max_results: fsMax,
+          format: "json",
+        },
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+      });
+      fsData = fsResp.data;
+    } catch (err) {
+      console.error("FatSecret search failed, falling back:", err?.response?.data || err.message);
+      const fallback = await estimateWithGPT(food);
+      cache.set(cacheKey, fallback);
+      return res.json(fallback);
+    }
+
+    const candidates = buildFatSecretCandidates(fsData);
+
+    // If no candidates -> AI fallback
+    if (!candidates.length) {
+      const fallback = await estimateWithGPT(food);
+      cache.set(cacheKey, fallback);
+      return res.json(fallback);
+    }
+
+    // 2) AI layer: select best match + return ONE normalized card
+    const selector = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.1,
+      text: { format: { type: "json_object" } },
+      input: [
+        {
+          role: "system",
+          content:
+            "Return ONLY valid JSON.\n\n" +
+            "Task:\n" +
+            "- Choose the SINGLE best FatSecret candidate for the user's input.\n" +
+            "- Use brand/name/description to match.\n" +
+            "- If none are suitable, set use_fallback=true.\n\n" +
+            "Nutrition rules:\n" +
+            "- Prefer using numbers found in candidate.description.\n" +
+            "- candidate.description typically contains kcal/macros per 100g or per serving.\n" +
+            "- If user provided explicit grams (e.g. 150g) AND the description is per 100g, scale totals.\n" +
+            "- If description is per serving and user did not specify grams, use the serving values.\n" +
+            "- If you cannot reliably extract calories + at least 2 macros, set use_fallback=true.\n\n" +
+            "Output must match the schema exactly. confidence is 0..1.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify(
+            {
+              user_input: food,
+              explicit_grams: grams,
+              candidates,
+              schema: {
+                use_fallback: "boolean",
+                chosen_index: "number | null",
+                name: "string",
+                mode: '"weight" | "serving"',
+                grams: "number | null",
+                calories: "number",
+                protein: "number",
+                carbs: "number",
+                fat: "number",
+                confidence: "number",
+                reason: "string",
+              },
+            },
+            null,
+            2
+          ),
         },
       ],
     });
 
-    return res.json({
-      mode: "serving",
-      ...JSON.parse(response.output_text),
-    });
+    const pick = safeJsonParse(selector.output_text);
+    const modelConfidence = clamp01(pick?.confidence, 0);
+
+    // Minimum confidence threshold fallback:
+    // - invalid model output
+    // - model requests fallback
+    // - no candidate selected
+    // - confidence too low
+    if (
+      !pick ||
+      pick.use_fallback ||
+      pick.chosen_index === null ||
+      modelConfidence < FATSECRET_MIN_CONFIDENCE
+    ) {
+      const fallback = await estimateWithGPT(food);
+
+      if (debug) {
+        fallback.debug = {
+          fallback_reason:
+            !pick
+              ? "invalid_model_output"
+              : pick.use_fallback
+              ? "model_requested_fallback"
+              : pick.chosen_index === null
+              ? "no_candidate_selected"
+              : `confidence_too_low (${modelConfidence} < ${FATSECRET_MIN_CONFIDENCE})`,
+          model_confidence: modelConfidence,
+          threshold: FATSECRET_MIN_CONFIDENCE,
+          candidate_count: candidates.length,
+        };
+      }
+
+      cache.set(cacheKey, fallback);
+      return res.json(fallback);
+    }
+
+    const chosen = candidates[pick.chosen_index];
+    if (!chosen) {
+      const fallback = await estimateWithGPT(food);
+      cache.set(cacheKey, fallback);
+      return res.json(fallback);
+    }
+
+    const result = {
+      source: "fatsecret",
+      mode: pick.mode || (grams ? "weight" : "serving"),
+      name: pick.name || chosen.name,
+      grams: pick.grams ?? grams ?? null,
+      calories: Math.round(Number(pick.calories) || 0),
+      protein: Number((Number(pick.protein) || 0).toFixed(1)),
+      carbs: Number((Number(pick.carbs) || 0).toFixed(1)),
+      fat: Number((Number(pick.fat) || 0).toFixed(1)),
+      confidence: modelConfidence,
+    };
+
+    if (debug) {
+      result.debug = {
+        chosen_index: pick.chosen_index,
+        chosen_food_id: chosen.food_id,
+        chosen_brand: chosen.brand,
+        chosen_name: chosen.name,
+        chosen_description: chosen.description,
+        reason: pick.reason,
+        candidate_count: candidates.length,
+        threshold: FATSECRET_MIN_CONFIDENCE,
+      };
+    }
+
+    cache.set(cacheKey, result);
+    return res.json(result);
   } catch (err) {
-    console.error("Estimate error:", err?.response?.data || err.message || err);
-    return res.status(500).json({ error: "Estimate failed" });
+    console.error("Resolve error:", err?.response?.data || err.message || err);
+
+    // last-resort fallback if possible
+    try {
+      const { food } = req.body || {};
+      if (food && typeof food === "string") {
+        const fallback = await estimateWithGPT(food);
+        return res.json(fallback);
+      }
+    } catch {
+      // ignore
+    }
+    return res.status(500).json({ error: "Resolve failed" });
   }
 });
 
@@ -419,15 +596,14 @@ Return JSON ONLY with this shape:
       ],
     });
 
-    let ai = JSON.parse(aiResponse.output_text);
+    let ai = safeJsonParse(aiResponse.output_text) || {};
 
-    // ---- Normalize / enforce rules in code (so UI stays consistent) ----
+    // ---- Normalize / enforce rules in code ----
     ai.status = normalizeStatus(ai.status);
     ai.confidence = clampNumber(ai.confidence, 0, 1) ?? 0.75;
     ai.issues = Array.isArray(ai.issues) ? ai.issues : [];
     ai.suggestions = Array.isArray(ai.suggestions) ? ai.suggestions : [];
 
-    // If status is verified* the final MUST be baseline (enforce regardless of model slip-ups)
     const baselineFinal = {
       bmr: baseline.bmr,
       tdee: baseline.tdee,
@@ -441,7 +617,6 @@ Return JSON ONLY with this shape:
     if (ai.status === "verified" || ai.status === "verified_with_suggestions") {
       ai.final = baselineFinal;
     } else {
-      // adjusted: make sure ai.final exists; if not, fall back to baselineFinal
       if (!ai.final || !ai.final.targets) ai.final = baselineFinal;
     }
 
