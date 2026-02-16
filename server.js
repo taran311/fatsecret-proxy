@@ -261,18 +261,68 @@ function extractExplicitMl(text) {
   return null;
 }
 
-function extractPerGrams(desc) {
-  const m = String(desc || "").match(/\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i);
+function extractExplicitCount(text) {
+  // e.g. "3 bell peppers", "2 bananas"
+  // Only counts at the START, and only integers 1-20 to avoid weird cases.
+  const m = String(text).trim().match(/^(\d{1,2})\s+([a-zA-Z])/);
   if (!m) return null;
   const n = Number(m[1]);
-  return Number.isFinite(n) && n > 0 ? n : null;
+  return Number.isFinite(n) && n >= 1 && n <= 20 ? n : null;
+}
+
+function extractPerItemCount(desc) {
+  // e.g. "Per 1 medium pepper - ..." should return 1
+  // Avoid measurement units like tbsp/tsp/cup/g/ml/oz/etc.
+  const d = String(desc || "").toLowerCase();
+  const m = d.match(/\bper\s+(\d{1,2})\s+([a-z]+)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = String(m[2] || "").toLowerCase();
+
+  const measurementUnits = new Set([
+    "g","gram","grams","kg","ml","l","litre","liter","oz","fl","floz",
+    "tbsp","tablespoon","tsp","teaspoon","cup","cups","serving","portion",
+    "pack","bag","bottle","can","slice","slices"
+  ]);
+
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (measurementUnits.has(unit)) return null;
+
+  return n;
+}
+
+function extractPerGrams(desc) {
+  const d = String(desc || "");
+  // Matches: "Per 100g" / "Per 1152g"
+  let m = d.match(/\bPer\s+(\d+(?:\.\d+)?)\s*g\b/i);
+  if (m) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  // Matches: "Per 1 serving (100g)"
+  m = d.match(/\((\d+(?:\.\d+)?)\s*g\)/i);
+  if (m) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  return null;
 }
 
 function extractPerMl(desc) {
-  const m = String(desc || "").match(/\bPer\s+(\d+(?:\.\d+)?)\s*ml\b/i);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) && n > 0 ? n : null;
+  const d = String(desc || "");
+  // Matches: "Per 100ml" / "Per 250 ml"
+  let m = d.match(/\bPer\s+(\d+(?:\.\d+)?)\s*ml\b/i);
+  if (m) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  // Matches: "Per 1 serving (250ml)"
+  m = d.match(/\((\d+(?:\.\d+)?)\s*ml\)/i);
+  if (m) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  return null;
 }
 
 function extractPerFlOzAsMl(desc) {
@@ -284,62 +334,11 @@ function extractPerFlOzAsMl(desc) {
 }
 
 function looksPerServingUnit(desc) {
-  const dRaw = String(desc || "");
-  const d = dRaw.toLowerCase();
-
-  // Obvious serving-based units we cannot reliably scale to grams/ml without extra info
-  if (/\bper\s+serving\b/i.test(dRaw)) return true;
-
-  // "Per 1 bar", "Per 2 tbsp", "Per 1 slice", etc.
-  const m = d.match(/\bper\s+(\d+(?:\.\d+)?)\s*([a-z]+)/i);
-  if (!m) return false;
-
-  const unit = m[2];
-
-  // Explicit scalable units are NOT "serving"
-  if (unit === "g" || unit === "gram" || unit === "grams") return false;
-  if (unit === "ml") return false;
-  if (unit === "floz" || unit === "fl" || unit === "oz") return false; // handled elsewhere
-
-  // Common unscalable serving units
-  const unscalable = new Set([
-    "tbsp",
-    "tbsps",
-    "tablespoon",
-    "tablespoons",
-    "tsp",
-    "tsps",
-    "teaspoon",
-    "teaspoons",
-    "slice",
-    "slices",
-    "bar",
-    "bars",
-    "pack",
-    "packs",
-    "bag",
-    "bags",
-    "pouch",
-    "pouches",
-    "tray",
-    "trays",
-    "can",
-    "cans",
-    "bottle",
-    "bottles",
-    "cup",
-    "cups",
-    "mug",
-    "mugs",
-    "piece",
-    "pieces",
-    "serving",
-    "servings",
-  ]);
-
-  return unscalable.has(unit);
+  const d = String(desc || "");
+  if (/\bPer\s+1\s+[A-Za-z]/i.test(d)) return true;
+  if (/\bPer\s+serving\b/i.test(d)) return true;
+  return false;
 }
-
 
 function looksLikeSnackPackQuery(query, grams) {
   if (!grams) return false;
@@ -413,13 +412,14 @@ function buildCandidates(fsData) {
         nutrition: parseNutrition(desc),
         per_grams: extractPerGrams(desc),
         per_ml: extractPerMl(desc) ?? extractPerFlOzAsMl(desc),
+        per_item_count: extractPerItemCount(desc),
       };
     })
     .filter((c) => c.nutrition);
 }
 
 // -------------------- Deterministic scaling for DB candidate --------------------
-function scaleCandidate(candidate, grams, ml) {
+function scaleCandidate(candidate, grams, ml, count) {
   const base = candidate.nutrition;
   let factor = 1;
   let mode = "serving";
@@ -430,6 +430,9 @@ function scaleCandidate(candidate, grams, ml) {
   } else if (ml && candidate.per_ml) {
     factor = ml / candidate.per_ml;
     mode = "volume";
+  } else if (!grams && !ml && count && candidate.per_item_count) {
+    factor = count / candidate.per_item_count;
+    mode = "serving";
   }
 
   return {
@@ -656,6 +659,7 @@ async function tryUpgradeFromDb({
   aiResult,
   grams,
   ml,
+  count,
   debug,
   brandHints,
   phaseLabel,
@@ -767,7 +771,7 @@ async function tryUpgradeFromDb({
     }
   }
 
-  const scaled = scaleCandidate(chosen, grams, ml);
+  const scaled = scaleCandidate(chosen, grams, ml, count);
 
   const dbResult = {
     source: "fatsecret",
@@ -839,6 +843,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
 
   const grams = extractExplicitGrams(food);
   const ml = extractExplicitMl(food);
+  const count = !grams && !ml ? extractExplicitCount(food) : null;
   const brandHints = extractBrandHints(food);
 
   try {
@@ -849,6 +854,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       aiResult,
       grams,
       ml,
+      count,
       debug,
       brandHints,
       phaseLabel: "primary",
