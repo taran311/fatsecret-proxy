@@ -130,6 +130,21 @@ const MIN_DB_TOKEN_SCORE = 0.35;
 const MIN_DB_AI_PICK_CONF = 0.6;
 const MAX_RESULTS = 12;
 
+// -------------------- Response hygiene --------------------
+function stripPer100gFieldsIfNotDebug(payload, debug) {
+  if (debug) return payload;
+  if (!payload || typeof payload !== "object") return payload;
+
+  // Prevent clients from accidentally showing per-100g values as totals
+  delete payload.calories_per_100g;
+  delete payload.protein_per_100g;
+  delete payload.carbs_per_100g;
+  delete payload.fat_per_100g;
+
+  return payload;
+}
+
+
 // -------------------- Text helpers --------------------
 function normText(s) {
   return String(s || "")
@@ -346,19 +361,6 @@ function toPositiveNumberOrNull(v) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// Prevent UI confusion: AI weight responses may include per-100g fields.
-// In production (debug=false) we strip them so clients only see totals.
-function stripPer100gFieldsIfNotDebug(result, debug) {
-  if (debug) return result;
-  if (!result || typeof result !== "object") return result;
-  const r = { ...result };
-  delete r.calories_per_100g;
-  delete r.protein_per_100g;
-  delete r.carbs_per_100g;
-  delete r.fat_per_100g;
-  return r;
-}
-
 // -------------------- Build FatSecret candidates --------------------
 function buildCandidates(fsData) {
   const foods = fsData?.foods?.food || [];
@@ -545,7 +547,7 @@ Return JSON:
     source: "ai",
     mode: ml ? "volume" : "serving",
     name: j.name,
-    grams: toPositiveNumberOrNull(j.estimated_serving_grams),
+    grams: ml ? null : toPositiveNumberOrNull(j.estimated_serving_grams),
     ml: ml ?? null,
     serving_description: j.serving_description,
     calories: Math.round(Number(j.calories) || 0),
@@ -735,8 +737,8 @@ async function tryUpgradeFromDb({
     source: "fatsecret",
     mode: scaled.mode,
     name: chosen.brand ? `${chosen.brand} ${chosen.name}` : chosen.name,
-    grams: grams ?? null,
-    ml: ml ?? null,
+    grams: scaled.mode === "weight" ? (grams ?? null) : (looksLikeSnackPackQuery(originalFood, grams) && isBagOrPackServing(chosen.description) ? (grams ?? null) : null),
+    ml: scaled.mode === "volume" ? (ml ?? null) : null,
     calories: scaled.calories,
     protein: scaled.protein,
     carbs: scaled.carbs,
@@ -817,8 +819,9 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     });
 
     if (primary.upgraded) {
-      if (!debug) cache.set(cacheKey, primary.out);
-      return res.json(primary.out);
+      const out = stripPer100gFieldsIfNotDebug({ ...primary.out }, debug);
+      if (!debug) cache.set(cacheKey, out);
+      return res.json(out);
     }
 
     // ONE cleaned retry (hard-capped)
@@ -836,8 +839,9 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       });
 
       if (cleanedRetry.upgraded) {
-        if (!debug) cache.set(cacheKey, cleanedRetry.out);
-        return res.json(cleanedRetry.out);
+        const out = stripPer100gFieldsIfNotDebug({ ...cleanedRetry.out }, debug);
+        if (!debug) cache.set(cacheKey, out);
+        return res.json(out);
       }
 
       const outRaw = debug
@@ -856,7 +860,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           }
         : aiResult;
 
-      const out = stripPer100gFieldsIfNotDebug(outRaw, debug);
+      const out = stripPer100gFieldsIfNotDebug({ ...outRaw }, debug);
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
@@ -865,7 +869,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
       : aiResult;
 
-    const out = stripPer100gFieldsIfNotDebug(outRaw, debug);
+    const out = stripPer100gFieldsIfNotDebug({ ...outRaw }, debug);
     if (!debug) cache.set(cacheKey, out);
     return res.json(out);
   } catch (err) {
@@ -873,7 +877,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     const outRaw = debug
       ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
       : aiResult;
-    const out = stripPer100gFieldsIfNotDebug(outRaw, debug);
+    const out = stripPer100gFieldsIfNotDebug({ ...outRaw }, debug);
     if (!debug) cache.set(cacheKey, out);
     return res.json(out);
   }
