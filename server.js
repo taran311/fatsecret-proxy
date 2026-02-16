@@ -130,21 +130,6 @@ const MIN_DB_TOKEN_SCORE = 0.35;
 const MIN_DB_AI_PICK_CONF = 0.6;
 const MAX_RESULTS = 12;
 
-// -------------------- Response hygiene --------------------
-function stripPer100gFieldsIfNotDebug(payload, debug) {
-  if (debug) return payload;
-  if (!payload || typeof payload !== "object") return payload;
-
-  // Prevent clients from accidentally showing per-100g values as totals
-  delete payload.calories_per_100g;
-  delete payload.protein_per_100g;
-  delete payload.carbs_per_100g;
-  delete payload.fat_per_100g;
-
-  return payload;
-}
-
-
 // -------------------- Text helpers --------------------
 function normText(s) {
   return String(s || "")
@@ -299,11 +284,62 @@ function extractPerFlOzAsMl(desc) {
 }
 
 function looksPerServingUnit(desc) {
-  const d = String(desc || "");
-  if (/\bPer\s+1\s+[A-Za-z]/i.test(d)) return true;
-  if (/\bPer\s+serving\b/i.test(d)) return true;
-  return false;
+  const dRaw = String(desc || "");
+  const d = dRaw.toLowerCase();
+
+  // Obvious serving-based units we cannot reliably scale to grams/ml without extra info
+  if (/\bper\s+serving\b/i.test(dRaw)) return true;
+
+  // "Per 1 bar", "Per 2 tbsp", "Per 1 slice", etc.
+  const m = d.match(/\bper\s+(\d+(?:\.\d+)?)\s*([a-z]+)/i);
+  if (!m) return false;
+
+  const unit = m[2];
+
+  // Explicit scalable units are NOT "serving"
+  if (unit === "g" || unit === "gram" || unit === "grams") return false;
+  if (unit === "ml") return false;
+  if (unit === "floz" || unit === "fl" || unit === "oz") return false; // handled elsewhere
+
+  // Common unscalable serving units
+  const unscalable = new Set([
+    "tbsp",
+    "tbsps",
+    "tablespoon",
+    "tablespoons",
+    "tsp",
+    "tsps",
+    "teaspoon",
+    "teaspoons",
+    "slice",
+    "slices",
+    "bar",
+    "bars",
+    "pack",
+    "packs",
+    "bag",
+    "bags",
+    "pouch",
+    "pouches",
+    "tray",
+    "trays",
+    "can",
+    "cans",
+    "bottle",
+    "bottles",
+    "cup",
+    "cups",
+    "mug",
+    "mugs",
+    "piece",
+    "pieces",
+    "serving",
+    "servings",
+  ]);
+
+  return unscalable.has(unit);
 }
+
 
 function looksLikeSnackPackQuery(query, grams) {
   if (!grams) return false;
@@ -547,7 +583,7 @@ Return JSON:
     source: "ai",
     mode: ml ? "volume" : "serving",
     name: j.name,
-    grams: ml ? null : toPositiveNumberOrNull(j.estimated_serving_grams),
+    grams: toPositiveNumberOrNull(j.estimated_serving_grams),
     ml: ml ?? null,
     serving_description: j.serving_description,
     calories: Math.round(Number(j.calories) || 0),
@@ -737,8 +773,8 @@ async function tryUpgradeFromDb({
     source: "fatsecret",
     mode: scaled.mode,
     name: chosen.brand ? `${chosen.brand} ${chosen.name}` : chosen.name,
-    grams: scaled.mode === "weight" ? (grams ?? null) : (looksLikeSnackPackQuery(originalFood, grams) && isBagOrPackServing(chosen.description) ? (grams ?? null) : null),
-    ml: scaled.mode === "volume" ? (ml ?? null) : null,
+    grams: grams ?? null,
+    ml: ml ?? null,
     calories: scaled.calories,
     protein: scaled.protein,
     carbs: scaled.carbs,
@@ -819,9 +855,8 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
     });
 
     if (primary.upgraded) {
-      const out = stripPer100gFieldsIfNotDebug({ ...primary.out }, debug);
-      if (!debug) cache.set(cacheKey, out);
-      return res.json(out);
+      if (!debug) cache.set(cacheKey, primary.out);
+      return res.json(primary.out);
     }
 
     // ONE cleaned retry (hard-capped)
@@ -839,12 +874,11 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
       });
 
       if (cleanedRetry.upgraded) {
-        const out = stripPer100gFieldsIfNotDebug({ ...cleanedRetry.out }, debug);
-        if (!debug) cache.set(cacheKey, out);
-        return res.json(out);
+        if (!debug) cache.set(cacheKey, cleanedRetry.out);
+        return res.json(cleanedRetry.out);
       }
 
-      const outRaw = debug
+      const out = debug
         ? {
             ...aiResult,
             debug: {
@@ -860,24 +894,21 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           }
         : aiResult;
 
-      const out = stripPer100gFieldsIfNotDebug({ ...outRaw }, debug);
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
 
-    const outRaw = debug
+    const out = debug
       ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
       : aiResult;
 
-    const out = stripPer100gFieldsIfNotDebug({ ...outRaw }, debug);
     if (!debug) cache.set(cacheKey, out);
     return res.json(out);
   } catch (err) {
     console.error("FatSecret resolve error:", err.response?.data || err.message || err);
-    const outRaw = debug
+    const out = debug
       ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
       : aiResult;
-    const out = stripPer100gFieldsIfNotDebug({ ...outRaw }, debug);
     if (!debug) cache.set(cacheKey, out);
     return res.json(out);
   }
