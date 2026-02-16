@@ -346,6 +346,19 @@ function toPositiveNumberOrNull(v) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+// Prevent UI confusion: AI weight responses may include per-100g fields.
+// In production (debug=false) we strip them so clients only see totals.
+function stripPer100gFieldsIfNotDebug(result, debug) {
+  if (debug) return result;
+  if (!result || typeof result !== "object") return result;
+  const r = { ...result };
+  delete r.calories_per_100g;
+  delete r.protein_per_100g;
+  delete r.carbs_per_100g;
+  delete r.fat_per_100g;
+  return r;
+}
+
 // -------------------- Build FatSecret candidates --------------------
 function buildCandidates(fsData) {
   const foods = fsData?.foods?.food || [];
@@ -827,7 +840,7 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
         return res.json(cleanedRetry.out);
       }
 
-      const out = debug
+      const outRaw = debug
         ? {
             ...aiResult,
             debug: {
@@ -843,21 +856,24 @@ app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
           }
         : aiResult;
 
+      const out = stripPer100gFieldsIfNotDebug(outRaw, debug);
       if (!debug) cache.set(cacheKey, out);
       return res.json(out);
     }
 
-    const out = debug
+    const outRaw = debug
       ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
       : aiResult;
 
+    const out = stripPer100gFieldsIfNotDebug(outRaw, debug);
     if (!debug) cache.set(cacheKey, out);
     return res.json(out);
   } catch (err) {
     console.error("FatSecret resolve error:", err.response?.data || err.message || err);
-    const out = debug
+    const outRaw = debug
       ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
       : aiResult;
+    const out = stripPer100gFieldsIfNotDebug(outRaw, debug);
     if (!debug) cache.set(cacheKey, out);
     return res.json(out);
   }
