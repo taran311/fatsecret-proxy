@@ -2,9 +2,9 @@
   "name": "fatsecret-proxy",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
@@ -16,7 +16,13 @@
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.21.1",
+    "express-rate-limit": "^7.5.0",
+    "firebase-admin": "^13.0.0",
     "node-cache": "^5.1.2",
     "openai": "^6.21.0"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
   }
 }

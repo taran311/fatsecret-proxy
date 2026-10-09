@@ -6,11 +6,16 @@ import cors from "cors";
 import compression from "compression";
 import NodeCache from "node-cache";
 import OpenAI from "openai";
+import { initializeApp } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json());
+// Render sits behind a proxy; needed so rate limiting sees real client IPs.
+app.set("trust proxy", 1);
+app.use(bodyParser.json({ limit: "20kb" }));
 app.use(compression());
 
 // -------------------- CORS --------------------
@@ -31,6 +36,58 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// -------------------- Auth (Firebase ID tokens) --------------------
+// Verifying ID tokens only needs the project ID (Google's public keys are
+// fetched automatically), so no service-account secret is required.
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "auth-af04a";
+initializeApp({ projectId: FIREBASE_PROJECT_ID });
+
+// Set REQUIRE_AUTH=false on Render only as a temporary escape hatch.
+const REQUIRE_AUTH = process.env.REQUIRE_AUTH !== "false";
+
+async function requireFirebaseUser(req, res, next) {
+  const header = req.get("Authorization") || "";
+  const match = header.match(/^Bearer (.+)$/);
+
+  if (!match) {
+    if (!REQUIRE_AUTH) return next();
+    return res.status(401).json({ error: "Missing auth token" });
+  }
+
+  try {
+    const decoded = await getAuth().verifyIdToken(match[1]);
+    req.user = { uid: decoded.uid };
+    return next();
+  } catch (err) {
+    console.warn("Rejected auth token:", err.code || err.message);
+    return res.status(401).json({ error: "Invalid or expired auth token" });
+  }
+}
+
+// Per-user limits (falls back to IP when auth is off). Keeps a leaked or
+// abusive client from running up the OpenAI / FatSecret bill.
+function userOrIpKey(req) {
+  return req.user?.uid ? `uid:${req.user.uid}` : `ip:${req.ip}`;
+}
+
+const foodLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.FOOD_RATE_LIMIT_PER_MIN) || 30,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "Too many requests, slow down a little." },
+});
+
+const macroLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: Number(process.env.MACRO_RATE_LIMIT_PER_HOUR) || 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "Too many requests, try again later." },
+});
 
 // -------------------- Clients --------------------
 const openai = new OpenAI({
@@ -87,7 +144,7 @@ async function ensureFatSecretToken(req, res, next) {
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
 // -------------------- FatSecret passthrough (optional) --------------------
-app.get("/foods/search/v1", ensureFatSecretToken, async (req, res) => {
+app.get("/foods/search/v1", requireFirebaseUser, foodLimiter, ensureFatSecretToken, async (req, res) => {
   const { search_expression, max_results, format } = req.query;
   const cacheKey = `fs:${search_expression}:${max_results || 12}:${
     format || "json"
@@ -810,7 +867,7 @@ async function tryUpgradeFromDb({
 }
 
 // -------------------- AI-first Hybrid Resolve --------------------
-app.post("/food/resolve", ensureFatSecretToken, async (req, res) => {
+app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken, async (req, res) => {
   const { food, debug } = req.body || {};
 
   if (!food || typeof food !== "string") {
@@ -974,7 +1031,7 @@ function normalizeStatus(s) {
   return "verified_with_suggestions";
 }
 
-app.post("/macro-targets", async (req, res) => {
+app.post("/macro-targets", requireFirebaseUser, macroLimiter, async (req, res) => {
   try {
     const { age, gender, height_cm, weight_kg, exercise_level } = req.body || {};
 
