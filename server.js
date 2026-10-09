@@ -15,7 +15,6 @@ dotenv.config();
 const app = express();
 // Render sits behind a proxy; needed so rate limiting sees real client IPs.
 app.set("trust proxy", 1);
-app.use(bodyParser.json({ limit: "20kb" }));
 app.use(compression());
 
 // -------------------- CORS --------------------
@@ -35,6 +34,15 @@ app.use(
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
+);
+
+// Body parsing comes after CORS, so even a "too large" error reaches the
+// web app as a readable response. Small JSON bodies everywhere; meal photos
+// (base64) get a bigger limit, parsed only after the user is signed in.
+const smallJson = bodyParser.json({ limit: "20kb" });
+const photoJson = bodyParser.json({ limit: "6mb" });
+app.use((req, res, next) =>
+  req.path === "/food/photo" ? next() : smallJson(req, res, next)
 );
 
 // -------------------- Auth (Firebase ID tokens) --------------------
@@ -90,22 +98,51 @@ const macroLimiter = rateLimit({
 });
 
 // -------------------- Clients --------------------
+// The SDK's defaults (10 minute timeout, 2 retries) would leave someone
+// staring at a spinner; fail fast and let the app show a retry instead.
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+  timeout: Number(process.env.OPENAI_TIMEOUT_MS) || 25000,
+  maxRetries: 1,
 });
+
+// Models are settable on Render without a code change. The "pick" model
+// only chooses between a few database matches, so a smaller/faster model
+// works well there if you want to save time and money.
+const AI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const AI_PICK_MODEL = process.env.OPENAI_PICK_MODEL || AI_MODEL;
 
 // -------------------- FatSecret --------------------
 const FATSECRET_API_URL = "https://platform.fatsecret.com/rest/server.api";
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-const cache = new NodeCache({ stdTTL: 300 }); // 5 minutes
+// In-memory cache. Nutrition for "2 eggs" doesn't change, so successful
+// lookups are kept for a week (until the server restarts); maxKeys stops it
+// growing without limit on the small Render instance.
+const cache = new NodeCache({ stdTTL: 300, maxKeys: 5000 });
+const RESOLVE_TTL_SECONDS = 60 * 60 * 24 * 7;
+
+// FatSecret calls get a timeout: without one a stuck request hangs forever.
+const fatsecret = axios.create({ timeout: 10000 });
 
 let accessToken = null;
 let tokenExpirationTime = 0;
+let tokenRefresh = null;
+
+// Fetches a token, sharing one request between everyone who needs it at
+// the same moment (instead of each request fetching its own).
+function refreshAccessToken() {
+  if (!tokenRefresh) {
+    tokenRefresh = getAccessToken().finally(() => {
+      tokenRefresh = null;
+    });
+  }
+  return tokenRefresh;
+}
 
 async function getAccessToken() {
-  const response = await axios.post(
+  const response = await fatsecret.post(
     "https://oauth.fatsecret.com/connect/token",
     new URLSearchParams({
       grant_type: "client_credentials",
@@ -117,7 +154,8 @@ async function getAccessToken() {
   );
 
   accessToken = response.data.access_token;
-  tokenExpirationTime = Date.now() + response.data.expires_in * 1000;
+  // Refresh a minute early so a token never expires mid-request.
+  tokenExpirationTime = Date.now() + (response.data.expires_in - 60) * 1000;
 }
 
 async function ensureFatSecretToken(req, res, next) {
@@ -126,7 +164,7 @@ async function ensureFatSecretToken(req, res, next) {
       return res.status(500).json({ error: "CLIENT_ID/CLIENT_SECRET not set" });
     }
     if (!accessToken || Date.now() >= tokenExpirationTime) {
-      await getAccessToken();
+      await refreshAccessToken();
     }
     next();
   } catch (err) {
@@ -142,40 +180,6 @@ async function ensureFatSecretToken(req, res, next) {
 
 // -------------------- Health --------------------
 app.get("/health", (req, res) => res.status(200).send("OK"));
-
-// -------------------- FatSecret passthrough (optional) --------------------
-app.get("/foods/search/v1", requireFirebaseUser, foodLimiter, ensureFatSecretToken, async (req, res) => {
-  const { search_expression, max_results, format } = req.query;
-  const cacheKey = `fs:${search_expression}:${max_results || 12}:${
-    format || "json"
-  }`;
-
-  const cached = cache.get(cacheKey);
-  if (cached) return res.json(cached);
-
-  try {
-    const response = await axios.get(FATSECRET_API_URL, {
-      params: {
-        method: "foods.search",
-        search_expression,
-        max_results: max_results || 12,
-        format: format || "json",
-      },
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-    });
-
-    cache.set(cacheKey, response.data);
-    return res.json(response.data);
-  } catch (err) {
-    console.error("foods.search error:", err.response?.data || err.message || err);
-    return res
-      .status(err.response?.status || 500)
-      .json(err.response?.data || { error: "Internal Server Error" });
-  }
-});
 
 // ======================================================================
 // ========================= HYBRID RESOLVE ENGINE =======================
@@ -524,20 +528,7 @@ function isStrongGenericFallbackAllowed(query, candidate, token_score, grams, ml
 
 // -------------------- AI: estimate --------------------
 async function estimateAI(food) {
-  if (!process.env.OPENAI_API_KEY) {
-    return {
-      source: "ai",
-      mode: "serving",
-      name: food,
-      grams: null,
-      ml: null,
-      calories: 0,
-      protein: 0,
-      carbs: 0,
-      fat: 0,
-      confidence: 0.1,
-    };
-  }
+  if (!process.env.OPENAI_API_KEY) return aiFailure(food);
 
   const grams = extractExplicitGrams(food);
   const explicitMl = extractExplicitMl(food);
@@ -545,7 +536,7 @@ async function estimateAI(food) {
   // Weight-based: return per-100g, then scale in code
   if (grams) {
     const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
+      model: AI_MODEL,
       temperature: 0.05,
       text: { format: { type: "json_object" } },
       input: [
@@ -596,7 +587,7 @@ Return JSON:
 
   // Serving/volume-based
   const response = await openai.responses.create({
-    model: "gpt-4.1-mini",
+    model: AI_MODEL,
     temperature: 0.05,
     text: { format: { type: "json_object" } },
     input: [
@@ -666,7 +657,7 @@ async function pickBestCandidateIndex(query, candidates) {
   }));
 
   const resp = await openai.responses.create({
-    model: "gpt-4.1-mini",
+    model: AI_PICK_MODEL,
     temperature: 0,
     text: { format: { type: "json_object" } },
     input: [
@@ -694,26 +685,43 @@ async function pickBestCandidateIndex(query, candidates) {
 
 // -------------------- FatSecret search helper --------------------
 async function fatSecretSearch(search_expression) {
-  const fsRes = await axios.get(FATSECRET_API_URL, {
-    params: {
-      method: "foods.search",
-      search_expression,
-      max_results: MAX_RESULTS,
-      format: "json",
-    },
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-  });
-  return buildCandidates(fsRes.data);
+  const cacheKey = `fs:${normalizeFood(search_expression)}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  const search = () =>
+    fatsecret.get(FATSECRET_API_URL, {
+      params: {
+        method: "foods.search",
+        search_expression,
+        max_results: MAX_RESULTS,
+        format: "json",
+      },
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+  let fsRes;
+  try {
+    fsRes = await search();
+  } catch (err) {
+    // Token revoked or expired early: get a new one and try once more.
+    if (err.response?.status !== 401) throw err;
+    await refreshAccessToken();
+    fsRes = await search();
+  }
+  const candidates = buildCandidates(fsRes.data);
+  cache.set(cacheKey, candidates, RESOLVE_TTL_SECONDS);
+  return candidates;
 }
 
 // -------------------- One-pass upgrade attempt --------------------
 async function tryUpgradeFromDb({
   query,
   originalFood,
-  aiResult,
+  aiResultPromise,
   grams,
   ml,
   count,
@@ -794,7 +802,9 @@ async function tryUpgradeFromDb({
     };
   }
 
-  // Confidence gate
+  // Confidence gate. The AI estimate has been running alongside the
+  // database search and pick; only now do we need to wait for it.
+  const aiResult = await aiResultPromise;
   const aiIsLow = (aiResult?.confidence ?? 0) < MIN_AI_CONFIDENCE;
   const dbPickIsWeak = pick.confidence < MIN_DB_AI_PICK_CONF;
   if (dbPickIsWeak && !aiIsLow) {
@@ -867,48 +877,72 @@ async function tryUpgradeFromDb({
 }
 
 // -------------------- AI-first Hybrid Resolve --------------------
+/** Same food, same cache entry: "2 Eggs " and "2 eggs" share a lookup. */
+function normalizeFood(food) {
+  return String(food).trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Returned when the AI estimate itself failed (not just low confidence). */
+function aiFailure(food) {
+  return {
+    source: "ai",
+    mode: "serving",
+    name: food,
+    grams: null,
+    ml: null,
+    calories: 0,
+    protein: 0,
+    carbs: 0,
+    fat: 0,
+    confidence: 0.1,
+    failed: true,
+  };
+}
+
+// -------------------- AI-first Hybrid Resolve --------------------
+// The AI estimate and the database search + pick run at the same time, so
+// a lookup takes about as long as the slower of the two, not both added up.
 app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken, async (req, res) => {
   const { food, debug } = req.body || {};
 
-  if (!food || typeof food !== "string") {
+  if (!food || typeof food !== "string" || !food.trim()) {
     return res.status(400).json({ error: "food is required" });
   }
+  if (food.length > 200) {
+    return res.status(400).json({ error: "Describe one food at a time" });
+  }
 
-  const cacheKey = `resolve-ai-first:${food}`;
+  const cacheKey = `resolve:v2:${normalizeFood(food)}`;
   const cached = cache.get(cacheKey);
   if (cached && !debug) return res.json(cached);
 
-  // Always compute AI first
-  let aiResult;
-  try {
-    aiResult = await estimateAI(food);
-  } catch (err) {
+  const aiResultPromise = estimateAI(food).catch((err) => {
     console.error("AI estimate failed:", err.response?.data || err.message || err);
-    aiResult = {
-      source: "ai",
-      mode: "serving",
-      name: food,
-      grams: null,
-      ml: null,
-      calories: 0,
-      protein: 0,
-      carbs: 0,
-      fat: 0,
-      confidence: 0.1,
-    };
-  }
+    return aiFailure(food);
+  });
 
   const grams = extractExplicitGrams(food);
   const ml = extractExplicitMl(food);
   const count = !grams && !ml ? extractExplicitCount(food) : null;
   const brandHints = extractBrandHints(food);
 
+  // Only cache real answers. A failed lookup returns an error so the app
+  // can offer a retry, rather than silently logging 0 kcal (and remembering
+  // that 0 for a week).
+  const finish = (out) => {
+    if (out.failed && !debug) {
+      return res.status(502).json({ error: "Couldn't look that up, try again" });
+    }
+    if (!debug) cache.set(cacheKey, out, RESOLVE_TTL_SECONDS);
+    return res.json(out);
+  };
+
   try {
     // Primary attempt
     const primary = await tryUpgradeFromDb({
       query: food,
       originalFood: food,
-      aiResult,
+      aiResultPromise,
       grams,
       ml,
       count,
@@ -916,11 +950,7 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
       brandHints,
       phaseLabel: "primary",
     });
-
-    if (primary.upgraded) {
-      if (!debug) cache.set(cacheKey, primary.out);
-      return res.json(primary.out);
-    }
+    if (primary.upgraded) return finish(primary.out);
 
     // ONE cleaned retry (hard-capped)
     const cleaned = cleanQueryForFatSecret(food, brandHints);
@@ -928,52 +958,49 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
       const cleanedRetry = await tryUpgradeFromDb({
         query: cleaned,
         originalFood: food,
-        aiResult,
+        aiResultPromise,
         grams,
         ml,
         debug,
         brandHints,
         phaseLabel: "cleaned_retry",
       });
+      if (cleanedRetry.upgraded) return finish(cleanedRetry.out);
 
-      if (cleanedRetry.upgraded) {
-        if (!debug) cache.set(cacheKey, cleanedRetry.out);
-        return res.json(cleanedRetry.out);
-      }
-
-      const out = debug
-        ? {
-            ...aiResult,
-            debug: {
-              used: "ai_only",
-              reason: "db_upgrade_failed_after_one_retry",
-              primary: { reason: primary.reason, meta: primary.meta },
-              cleaned_retry: {
-                query: cleaned,
-                reason: cleanedRetry.reason,
-                meta: cleanedRetry.meta,
+      const aiResult = await aiResultPromise;
+      return finish(
+        debug
+          ? {
+              ...aiResult,
+              debug: {
+                used: "ai_only",
+                reason: "db_upgrade_failed_after_one_retry",
+                primary: { reason: primary.reason, meta: primary.meta },
+                cleaned_retry: {
+                  query: cleaned,
+                  reason: cleanedRetry.reason,
+                  meta: cleanedRetry.meta,
+                },
               },
-            },
-          }
-        : aiResult;
-
-      if (!debug) cache.set(cacheKey, out);
-      return res.json(out);
+            }
+          : aiResult
+      );
     }
 
-    const out = debug
-      ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
-      : aiResult;
-
-    if (!debug) cache.set(cacheKey, out);
-    return res.json(out);
+    const aiResult = await aiResultPromise;
+    return finish(
+      debug
+        ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
+        : aiResult
+    );
   } catch (err) {
     console.error("FatSecret resolve error:", err.response?.data || err.message || err);
-    const out = debug
-      ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
-      : aiResult;
-    if (!debug) cache.set(cacheKey, out);
-    return res.json(out);
+    const aiResult = await aiResultPromise;
+    return finish(
+      debug
+        ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
+        : aiResult
+    );
   }
 });
 
@@ -1029,6 +1056,21 @@ function normalizeStatus(s) {
   if (v === "verified_with_suggestions") return "verified_with_suggestions";
   if (v === "adjusted") return "adjusted";
   return "verified_with_suggestions";
+}
+
+/** An AI "adjusted" result must have every goal, with sensible numbers
+ *  within 25% of the calculated calories. */
+function adjustedTargetsLookSane(final, baselineFinal) {
+  const t = final?.targets;
+  if (!t) return false;
+  return ["lose", "maintain", "gain"].every((goal) => {
+    const g = t[goal];
+    const base = baselineFinal.targets[goal]?.calories;
+    if (!g || !base) return false;
+    const nums = [g.calories, g.protein_g, g.carbs_g, g.fat_g].map(Number);
+    if (!nums.every((n) => Number.isFinite(n) && n >= 0)) return false;
+    return Math.abs(nums[0] - base) <= base * 0.25;
+  });
 }
 
 app.post("/macro-targets", requireFirebaseUser, macroLimiter, async (req, res) => {
@@ -1094,9 +1136,23 @@ app.post("/macro-targets", requireFirebaseUser, macroLimiter, async (req, res) =
       },
     };
 
+    const baselineFinal = {
+      bmr: baseline.bmr,
+      tdee: baseline.tdee,
+      targets: {
+        lose: baseline.targets.lose,
+        maintain: baseline.targets.maintain,
+        gain: baseline.targets.gain,
+      },
+    };
+
     // ---- AI verification (should NOT change numbers unless rules violated) ----
-    const aiResponse = await openai.responses.create({
-      model: "gpt-4.1-mini",
+    // The numbers above are already complete. If the AI check is slow or
+    // fails, answer with them rather than an error.
+    let aiResponse;
+    try {
+      aiResponse = await openai.responses.create({
+      model: AI_MODEL,
       temperature: 0,
       text: { format: { type: "json_object" } },
       input: [
@@ -1144,9 +1200,18 @@ Return JSON ONLY with this shape:
 }`,
         },
       ],
-    });
+      });
+    } catch (err) {
+      console.warn("Macro AI check skipped:", err?.message || err);
+      return res.json({ mode: "baseline", baseline, ai: { status: "verified", final: baselineFinal } });
+    }
 
-    let ai = JSON.parse(aiResponse.output_text);
+    let ai;
+    try {
+      ai = JSON.parse(aiResponse.output_text);
+    } catch {
+      ai = { status: "verified" };
+    }
 
     // ---- Normalize / enforce rules in code (so UI stays consistent) ----
     ai.status = normalizeStatus(ai.status);
@@ -1154,20 +1219,13 @@ Return JSON ONLY with this shape:
     ai.issues = Array.isArray(ai.issues) ? ai.issues : [];
     ai.suggestions = Array.isArray(ai.suggestions) ? ai.suggestions : [];
 
-    const baselineFinal = {
-      bmr: baseline.bmr,
-      tdee: baseline.tdee,
-      targets: {
-        lose: baseline.targets.lose,
-        maintain: baseline.targets.maintain,
-        gain: baseline.targets.gain,
-      },
-    };
-
     if (ai.status === "verified" || ai.status === "verified_with_suggestions") {
       ai.final = baselineFinal;
-    } else {
-      if (!ai.final || !ai.final.targets) ai.final = baselineFinal;
+    } else if (!adjustedTargetsLookSane(ai.final, baselineFinal)) {
+      // Don't trust an "adjustment" that's missing numbers or far off the
+      // calculated baseline.
+      ai.status = "verified";
+      ai.final = baselineFinal;
     }
 
     return res.json({
@@ -1178,6 +1236,168 @@ Return JSON ONLY with this shape:
   } catch (err) {
     console.error("Macro targets error:", err?.response?.data || err.message || err);
     return res.status(500).json({ error: "Failed to calculate macro targets" });
+  }
+});
+
+// -------------------- Contactless: barcode --------------------
+// Looks a packaged food up by its barcode in Open Food Facts (free, no key,
+// strong UK coverage). Returns nutrition per serving when the pack lists
+// one, otherwise per 100 g / 100 ml.
+const barcodeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.BARCODE_RATE_LIMIT_PER_MIN) || 30,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "Too many requests, slow down a little." },
+});
+
+function numOrNull(v) {
+  const n = typeof v === "string" ? parseFloat(v) : v;
+  return typeof n === "number" && Number.isFinite(n) ? n : null;
+}
+
+app.get("/food/barcode", requireFirebaseUser, barcodeLimiter, async (req, res) => {
+  const code = String(req.query.code || "").replace(/\D/g, "");
+  if (code.length < 6 || code.length > 14) {
+    return res.status(400).json({ error: "That doesn't look like a barcode" });
+  }
+
+  const cacheKey = `barcode:${code}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const r = await axios.get(
+      `https://world.openfoodfacts.org/api/v2/product/${code}.json`,
+      {
+        params: {
+          fields:
+            "product_name,brands,serving_size,serving_quantity,nutriments,quantity",
+        },
+        headers: { "User-Agent": "TheCalorieCard/1.0 (thecaloriecard.com)" },
+        timeout: 10000,
+      }
+    );
+    const p = r.data?.product;
+    if (r.data?.status !== 1 || !p) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const n = p.nutriments || {};
+    // Some packs only list energy in kJ (Open Food Facts' plain "energy"
+    // is kJ too): convert those to kcal.
+    const kcal = (kcalKey, kjKeys) => {
+      const direct = numOrNull(n[kcalKey]);
+      if (direct != null) return direct;
+      for (const k of kjKeys) {
+        const kj = numOrNull(n[k]);
+        if (kj != null) return kj / 4.184;
+      }
+      return null;
+    };
+    const perServing = kcal("energy-kcal_serving", ["energy-kj_serving", "energy_serving"]);
+    const per100 = kcal("energy-kcal_100g", ["energy-kj_100g", "energy_100g"]);
+    const useServing = perServing != null && perServing > 0;
+    if (!useServing && per100 == null) {
+      return res.status(404).json({ error: "No nutrition info for this product" });
+    }
+
+    const pick = (key) =>
+      numOrNull(n[`${key}_${useServing ? "serving" : "100g"}`]) ?? 0;
+    const brand = String(p.brands || "").split(",")[0].trim();
+    const name = [brand, p.product_name].filter(Boolean).join(" ").trim();
+
+    const result = {
+      source: "barcode",
+      barcode: code,
+      name: name || "Scanned product",
+      portion: useServing ? String(p.serving_size || "1 serving") : "100 g",
+      calories: round1(useServing ? perServing : per100),
+      protein: round1(pick("proteins")),
+      carbs: round1(pick("carbohydrates")),
+      fat: round1(pick("fat")),
+    };
+    cache.set(cacheKey, result, 60 * 60 * 24);
+    return res.json(result);
+  } catch (err) {
+    if (err.response?.status === 404) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+    console.error("Barcode lookup error:", err.response?.data || err.message);
+    return res.status(502).json({ error: "Barcode lookup failed" });
+  }
+});
+
+// -------------------- Contactless: meal photo --------------------
+// Turns a photo of a meal into a list of foods with portions, e.g.
+// ["150g grilled chicken breast", "1 cup white rice"]. The app then looks
+// each one up through /food/resolve like typed food, so the database
+// still gets first say on the numbers.
+const photoLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: Number(process.env.PHOTO_RATE_LIMIT_PER_HOUR) || 20,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "Too many photos this hour, try again later." },
+});
+
+app.post("/food/photo", requireFirebaseUser, photoLimiter, photoJson, async (req, res) => {
+  const image = String(req.body?.image || "");
+  const mime = String(req.body?.mime || "image/jpeg");
+  if (!image || image.length > 5_500_000) {
+    return res.status(400).json({ error: "Send one photo under about 4 MB" });
+  }
+  if (!/^image\/(jpeg|png|webp|gif)$/.test(mime)) {
+    return res.status(400).json({ error: "Unsupported image type" });
+  }
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: "AI is not configured" });
+  }
+
+  try {
+    const response = await openai.responses.create({
+      model: AI_MODEL,
+      temperature: 0.1,
+      text: { format: { type: "json_object" } },
+      input: [
+        {
+          role: "system",
+          content:
+            "You identify food in photos for a calorie tracker. Return ONLY JSON: " +
+            '{"items": ["<portion> <food>", ...]}. One entry per distinct food or drink, ' +
+            "with a realistic portion estimate in grams, ml or units " +
+            '(e.g. "150g grilled chicken breast", "1 slice toast with butter", "330ml cola"). ' +
+            "Include sauces and drinks you can see. At most 8 items. " +
+            'If there is no food in the photo, return {"items": []}.',
+        },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "What food is in this photo?" },
+            { type: "input_image", image_url: `data:${mime};base64,${image}` },
+          ],
+        },
+      ],
+    });
+
+    let items = [];
+    try {
+      const parsed = JSON.parse(response.output_text || "{}");
+      if (Array.isArray(parsed.items)) {
+        items = parsed.items
+          .map((s) => String(s).trim())
+          .filter((s) => s.length > 0 && s.length <= 120)
+          .slice(0, 8);
+      }
+    } catch (_) {
+      items = [];
+    }
+    return res.json({ items });
+  } catch (err) {
+    console.error("Photo error:", err?.response?.data || err.message || err);
+    return res.status(502).json({ error: "Couldn't read that photo" });
   }
 });
 
