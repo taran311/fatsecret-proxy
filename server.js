@@ -1444,7 +1444,89 @@ const COACH_SYSTEM_PROMPT = [
   "  registered dietitian.",
   "- Don't invent numbers you weren't given; estimate food calories roughly and say they're estimates.",
   "- Stay on topic (food, nutrition, habits, the app). Politely steer back if asked about other things.",
+  "",
+  "Changing their diary and recipes:",
+  "You can PROPOSE changes; the app shows each one as a summary card with Accept / Reject, and nothing",
+  "changes until the user accepts. Only propose a change when the user clearly asks for it (e.g. 'add 2",
+  "eggs to breakfast', 'log my chilli for dinner', 'remove the crisps', 'save this as a recipe'). If you",
+  "suggested a meal and they say 'add that', propose it. If something important is unclear (which meal,",
+  "how much), ask instead of guessing wildly; otherwise use sensible everyday portions.",
+  "In 'reply', say briefly what you've put together (e.g. 'Here you go, tap Accept to add it.'). Don't",
+  "claim anything has been added yet. The app works out the calories itself, so don't list numbers for",
+  "proposed items unless asked.",
+  "",
+  "Always answer with a JSON object: {\"reply\": string, \"actions\": [ ... ]} (actions may be empty).",
+  "Action types (at most 3 per answer):",
+  '- {"type":"log_food","meal":"Brekkie|Lunch|Dinner|Snacks","items":["2 large scrambled eggs","1 slice',
+  '  wholemeal toast with butter"]}  items are plain food descriptions WITH amounts, one food each (max 10).',
+  '- {"type":"log_recipe","recipe_id":"<id from context.recipes>","meal":"...","servings":1}',
+  '- {"type":"remove_food","entry_ids":["<id from context.entries_today>", ...]}',
+  '- {"type":"create_recipe","name":"Chicken stir fry","servings":2,"ingredients":["300g chicken breast",',
+  '  "1 tbsp soy sauce", ...]}  ingredients for the WHOLE recipe, with amounts (max 20).',
+  '- {"type":"delete_recipe","recipe_id":"<id from context.recipes>"}',
+  "Only use ids that appear in the context. Diary changes are for today only. Pick the meal from what",
+  "they said, or the time of day if they didn't say (morning Brekkie, midday Lunch, evening Dinner,",
+  "anything small between meals Snacks).",
 ].join("\n");
+
+const COACH_MEALS = ["Brekkie", "Lunch", "Dinner", "Snacks"];
+
+// Keeps only well-formed actions that point at things the user really has.
+function sanitizeCoachActions(actions, context) {
+  if (!Array.isArray(actions)) return [];
+  const entryIds = new Set(
+    (Array.isArray(context?.entries_today) ? context.entries_today : [])
+      .map((e) => String(e?.id ?? ""))
+      .filter(Boolean)
+  );
+  const recipeIds = new Set(
+    (Array.isArray(context?.recipes) ? context.recipes : [])
+      .map((r) => String(r?.id ?? ""))
+      .filter(Boolean)
+  );
+  const meal = (m) => {
+    const hit = COACH_MEALS.find((x) => x.toLowerCase() === String(m ?? "").toLowerCase());
+    return hit || null;
+  };
+  const texts = (list, max) =>
+    (Array.isArray(list) ? list : [])
+      .map((t) => clip(String(t ?? "").trim(), 120))
+      .filter(Boolean)
+      .slice(0, max);
+  const servings = (n) => {
+    const v = Number(n);
+    return Number.isFinite(v) && v > 0 && v <= 20 ? Math.round(v * 100) / 100 : 1;
+  };
+
+  const out = [];
+  for (const a of actions.slice(0, 3)) {
+    const type = String(a?.type ?? "");
+    if (type === "log_food") {
+      const items = texts(a.items, 10);
+      if (items.length) out.push({ type, meal: meal(a.meal) || "Snacks", items });
+    } else if (type === "log_recipe") {
+      const id = String(a.recipe_id ?? "");
+      if (recipeIds.has(id)) {
+        out.push({ type, recipe_id: id, meal: meal(a.meal) || "Snacks", servings: servings(a.servings) });
+      }
+    } else if (type === "remove_food") {
+      const ids = (Array.isArray(a.entry_ids) ? a.entry_ids : [])
+        .map((x) => String(x ?? ""))
+        .filter((x) => entryIds.has(x));
+      if (ids.length) out.push({ type, entry_ids: [...new Set(ids)].slice(0, 20) });
+    } else if (type === "create_recipe") {
+      const name = clip(String(a.name ?? "").trim(), 60);
+      const ingredients = texts(a.ingredients, 20);
+      if (name && ingredients.length) {
+        out.push({ type, name, servings: servings(a.servings), ingredients });
+      }
+    } else if (type === "delete_recipe") {
+      const id = String(a.recipe_id ?? "");
+      if (recipeIds.has(id)) out.push({ type, recipe_id: id });
+    }
+  }
+  return out;
+}
 
 function clip(s, n) {
   s = String(s ?? "");
@@ -1467,9 +1549,10 @@ app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
     return res.status(400).json({ error: "Ask me something first" });
   }
 
+  const ctx = body.context && typeof body.context === "object" ? body.context : {};
   let context = "";
   try {
-    context = clip(JSON.stringify(body.context ?? {}), 4000);
+    context = clip(JSON.stringify(ctx), 16000);
   } catch {
     context = "{}";
   }
@@ -1478,7 +1561,8 @@ app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
     const response = await openai.responses.create({
       model: process.env.OPENAI_COACH_MODEL || AI_MODEL,
       temperature: 0.6,
-      max_output_tokens: 450,
+      max_output_tokens: 900,
+      text: { format: { type: "json_object" } },
       input: [
         { role: "system", content: COACH_SYSTEM_PROMPT },
         {
@@ -1491,11 +1575,20 @@ app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
         ...messages,
       ],
     });
-    const reply = String(response.output_text || "").trim();
+    let parsed = {};
+    try {
+      parsed = JSON.parse(response.output_text || "{}");
+    } catch {
+      // Not JSON after all: treat the whole thing as the reply.
+      parsed = { reply: response.output_text };
+    }
+    const actions = sanitizeCoachActions(parsed.actions, ctx);
+    let reply = String(parsed.reply ?? "").trim();
+    if (!reply && actions.length) reply = "Here's what I've put together. Have a look:";
     if (!reply) {
       return res.status(502).json({ error: "Coach is lost for words. Try again?" });
     }
-    return res.json({ reply });
+    return res.json({ reply, actions });
   } catch (err) {
     console.error("Coach error:", err?.response?.data || err.message || err);
     return res.status(502).json({ error: "Coach couldn't answer just now. Try again?" });
