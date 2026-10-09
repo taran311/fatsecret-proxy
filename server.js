@@ -1401,6 +1401,107 @@ app.post("/food/photo", requireFirebaseUser, photoLimiter, photoJson, async (req
   }
 });
 
+// -------------------- Calorie Coach --------------------
+// A friendly chat about your day. The app sends today's numbers (balance,
+// goals, what you've eaten, the last week) so answers are about you.
+// Safety rules live here, on the server, so they can't be switched off.
+const coachLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: Number(process.env.COACH_RATE_LIMIT_PER_HOUR) || 40,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "You've chatted a lot this hour. Take a breather and come back soon." },
+});
+
+const COACH_SYSTEM_PROMPT = [
+  "You are Calorie Coach, the friendly assistant inside The Calorie Card, a UK calorie-tracking app",
+  "where the daily calorie budget works like a bank card balance (calories left = money left to spend).",
+  "",
+  "Tone: warm, upbeat, non-judgemental, practical. British English. Talk like a supportive friend, not a",
+  "doctor. Keep replies short: usually 2-6 sentences or a few bullet points. Use the user's real numbers",
+  "from the context when helpful. One or two emoji at most.",
+  "",
+  "What you help with: meal and snack ideas that fit the calories and macros left; hitting protein;",
+  "healthier swaps; eating out; cravings; reflecting on the day or week; motivation; explaining macros",
+  "and how the app works (card balance, Pots, direct debits, finishing a day, streaks).",
+  "",
+  "When someone is over budget: be kind first. One day over is normal and does not undo progress;",
+  "consistency over weeks is what matters. If they want to balance it out, suggest spreading it gently:",
+  "at most about 10% of their daily goal (and never more than 200 kcal) less on each of the next few",
+  "days, through easy swaps and lighter choices, or simply getting back to normal tomorrow. Mention that",
+  "unspent calories can go in their Pot if Pots is on.",
+  "",
+  "Safety rules (never break these):",
+  "- Never suggest skipping meals, fasting to compensate, eating below about 1200 kcal (women) or",
+  "  1500 kcal (men) a day, purging, laxatives, diet pills, or exercising to 'burn off' food.",
+  "- Never shame, moralise about food, or call foods 'bad' or 'cheat' foods.",
+  "- If the user mentions restricting heavily, bingeing and purging, feeling out of control around food,",
+  "  intense guilt about eating, or self-harm, respond with care, don't give calorie advice, and gently",
+  "  suggest talking to someone they trust or their GP; in the UK, Beat (the eating disorder charity) has",
+  "  a helpline at beateatingdisorders.org.uk, and Samaritans can be reached on 116 123 any time.",
+  "- For medical conditions, pregnancy, medication or diabetes, keep it general and suggest their GP or a",
+  "  registered dietitian.",
+  "- Don't invent numbers you weren't given; estimate food calories roughly and say they're estimates.",
+  "- Stay on topic (food, nutrition, habits, the app). Politely steer back if asked about other things.",
+].join("\n");
+
+function clip(s, n) {
+  s = String(s ?? "");
+  return s.length > n ? s.slice(0, n) : s;
+}
+
+app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: "AI is not configured" });
+  }
+  const body = req.body || {};
+  const raw = Array.isArray(body.messages) ? body.messages : [];
+  // Last 12 turns, user/assistant only, each kept short.
+  const messages = raw
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .slice(-12)
+    .map((m) => ({ role: m.role, content: clip(m.content, 1000) }))
+    .filter((m) => m.content.trim().length > 0);
+  if (!messages.length || messages[messages.length - 1].role !== "user") {
+    return res.status(400).json({ error: "Ask me something first" });
+  }
+
+  let context = "";
+  try {
+    context = clip(JSON.stringify(body.context ?? {}), 4000);
+  } catch {
+    context = "{}";
+  }
+
+  try {
+    const response = await openai.responses.create({
+      model: process.env.OPENAI_COACH_MODEL || AI_MODEL,
+      temperature: 0.6,
+      max_output_tokens: 450,
+      input: [
+        { role: "system", content: COACH_SYSTEM_PROMPT },
+        {
+          role: "system",
+          content:
+            "Today's context from the app (numbers in kcal and grams; 'left' is what's left on the card, " +
+            "negative means over budget):\n" +
+            context,
+        },
+        ...messages,
+      ],
+    });
+    const reply = String(response.output_text || "").trim();
+    if (!reply) {
+      return res.status(502).json({ error: "Coach is lost for words. Try again?" });
+    }
+    return res.json({ reply });
+  } catch (err) {
+    console.error("Coach error:", err?.response?.data || err.message || err);
+    return res.status(502).json({ error: "Coach couldn't answer just now. Try again?" });
+  }
+});
+
 // -------------------- Start server --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
