@@ -149,6 +149,9 @@ const AI_PICK_MODEL = process.env.OPENAI_PICK_MODEL || AI_MODEL;
 
 // -------------------- FatSecret --------------------
 const FATSECRET_API_URL = "https://platform.fatsecret.com/rest/server.api";
+// FatSecret's Basic plan only has the US database. With a plan that includes
+// the UK data, set FATSECRET_REGION=GB so UK brands are found.
+const FATSECRET_REGION = (process.env.FATSECRET_REGION || "").trim().toUpperCase();
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
@@ -239,13 +242,20 @@ function tokenize(s) {
   return normText(s).split(" ").filter(Boolean);
 }
 
+const LABEL_WORDS = new Set(["calories", "kcal", "fat", "carbs", "protein", "per"]);
+
 function tokenScore(query, candidate) {
   const qTokens = tokenize(query);
   const q = new Set(qTokens);
   if (!q.size) return 0;
 
-  const cTokens = tokenize(
-    `${candidate.brand || ""} ${candidate.name || ""} ${candidate.description || ""}`
+  // The description is FatSecret's label text ("Per 1 bar - Calories: ... |
+  // Protein: ..."), so words like "protein" or "fat" in it say nothing about
+  // which food it is. Each query word counts once.
+  const cTokens = new Set(
+    tokenize(
+      `${candidate.brand || ""} ${candidate.name || ""} ${candidate.description || ""}`
+    ).filter((t) => !LABEL_WORDS.has(t))
   );
 
   let hit = 0;
@@ -591,8 +601,10 @@ Return JSON:
   "protein_per_100g": number,
   "carbs_per_100g": number,
   "fat_per_100g": number,
+  "brand": string | null,
   "confidence": number
-}`,
+}
+"brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null.`,
         },
       ],
     });
@@ -613,6 +625,7 @@ Return JSON:
       confidence: Number.isFinite(Number(per100g.confidence))
         ? Number(per100g.confidence)
         : 0.7,
+      brand: cleanBrand(per100g.brand),
       calories_per_100g: Number(per100g.calories_per_100g),
       protein_per_100g: Number(per100g.protein_per_100g),
       carbs_per_100g: Number(per100g.carbs_per_100g),
@@ -654,8 +667,10 @@ Return JSON:
   "protein": number,
   "carbs": number,
   "fat": number,
+  "brand": string | null,
   "confidence": number
-}`,
+}
+"brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null.`,
       },
     ],
   });
@@ -677,12 +692,103 @@ Return JSON:
     carbs: round1(Number(j.carbs) || 0),
     fat: round1(Number(j.fat) || 0),
     confidence: Number.isFinite(Number(j.confidence)) ? Number(j.confidence) : 0.65,
+    brand: cleanBrand(j.brand),
   };
+}
+
+function cleanBrand(b) {
+  const s = typeof b === "string" ? b.trim() : "";
+  return s && !/^(null|none|n\/a|generic|homemade)$/i.test(s) ? s : null;
+}
+
+// -------------------- AI + web: branded products --------------------
+// FatSecret doesn't have every brand (and its free plan is US-only), and the
+// model can't know every product's label. For a named brand the database
+// didn't have, look the label up online. Off with WEB_LOOKUP=off.
+const WEB_LOOKUP = process.env.WEB_LOOKUP !== "off";
+const WEB_MODEL = process.env.OPENAI_WEB_MODEL || "gpt-4.1-mini";
+
+async function webLookup(food, grams, ml) {
+  const response = await openai.responses.create({
+    model: WEB_MODEL,
+    temperature: 0,
+    tools: [{ type: "web_search", user_location: { type: "approximate", country: "GB" } }],
+    input: [
+      {
+        role: "system",
+        content:
+          "You find the official nutrition label for a branded food or drink sold in the UK. " +
+          "Search the web, prefer the brand's own site, a UK supermarket listing or a nutrition database " +
+          "entry for that exact product. If no flavour is given, use the brand's standard or most common one. " +
+          "Reply with ONLY a JSON object, no other text:\n" +
+          '{"found": boolean, "name": string, "serving_description": string, "serving_grams": number|null, ' +
+          '"serving_ml": number|null, "calories": number, "protein": number, "carbs": number, "fat": number, ' +
+          '"calories_per_100g": number|null, "protein_per_100g": number|null, "carbs_per_100g": number|null, ' +
+          '"fat_per_100g": number|null}\n' +
+          "calories/protein/carbs/fat are for ONE serving as sold (one bar, one pack, one bottle). " +
+          'If you can\'t find this product\'s label, reply {"found": false}.',
+      },
+      { role: "user", content: food },
+    ],
+  });
+
+  const text = String(response.output_text || "");
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  const j = JSON.parse(m[0]);
+  if (!j?.found || !(Number(j.calories) > 0)) return null;
+
+  // "70g of X": scale from per-100g when the label gives it.
+  const per100 = Number(j.calories_per_100g);
+  if (grams && per100 > 0) {
+    const f = grams / 100;
+    return {
+      source: "web",
+      mode: "weight",
+      name: j.name || food,
+      grams,
+      ml: null,
+      calories: Math.round(per100 * f),
+      protein: round1((Number(j.protein_per_100g) || 0) * f),
+      carbs: round1((Number(j.carbs_per_100g) || 0) * f),
+      fat: round1((Number(j.fat_per_100g) || 0) * f),
+      confidence: 0.85,
+    };
+  }
+
+  const count = !grams && !ml ? extractExplicitCount(food) : null;
+  const k = count && count > 1 ? count : 1;
+  return {
+    source: "web",
+    mode: "serving",
+    name: j.name || food,
+    grams: toPositiveNumberOrNull(j.serving_grams) ? toPositiveNumberOrNull(j.serving_grams) * k : null,
+    ml: toPositiveNumberOrNull(j.serving_ml) ? toPositiveNumberOrNull(j.serving_ml) * k : null,
+    serving_description: j.serving_description,
+    calories: Math.round(Number(j.calories) * k),
+    protein: round1((Number(j.protein) || 0) * k),
+    carbs: round1((Number(j.carbs) || 0) * k),
+    fat: round1((Number(j.fat) || 0) * k),
+    confidence: 0.85,
+  };
+}
+
+/** The AI estimate, or for a named brand the database missed, its real label. */
+async function aiOrWebResult(food, aiResultPromise, grams, ml) {
+  const ai = await aiResultPromise;
+  if (!WEB_LOOKUP || ai.failed || !ai.brand || !process.env.OPENAI_API_KEY) return ai;
+  try {
+    const web = await webLookup(food, grams, ml);
+    return web || ai;
+  } catch (err) {
+    console.error("Web lookup failed:", err.response?.data || err.message || err);
+    return ai;
+  }
 }
 
 // -------------------- AI: choose best DB candidate among top-N --------------------
 async function pickBestCandidateIndex(query, candidates) {
-  if (!process.env.OPENAI_API_KEY) return { index: -1, confidence: 0 };
+  if (!process.env.OPENAI_API_KEY) return { index: -1, confidence: 0, failed: true };
 
   const simplified = candidates.map((c, i) => ({
     index: i,
@@ -699,7 +805,7 @@ async function pickBestCandidateIndex(query, candidates) {
       {
         role: "system",
         content:
-          'Pick the single best matching candidate index for the query.\nReturn ONLY JSON: {"index": number, "confidence": number}\nDo NOT pick unrelated foods.\nPrefer exact brand/name matches.\n',
+          'Pick the single best matching candidate index for the query.\nReturn ONLY JSON: {"index": number, "confidence": number}\nDo NOT pick unrelated foods.\nPrefer exact brand/name matches.\nIf the query names a brand and no candidate is that brand, return {"index": -1, "confidence": 0}.\nIf the query names a brand but not a flavour, any flavour of that brand is a good match.\n',
       },
       {
         role: "user",
@@ -720,7 +826,7 @@ async function pickBestCandidateIndex(query, candidates) {
 
 // -------------------- FatSecret search helper --------------------
 async function fatSecretSearch(search_expression) {
-  const cacheKey = `fs:${normalizeFood(search_expression)}`;
+  const cacheKey = `fs:${FATSECRET_REGION}:${normalizeFood(search_expression)}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
@@ -731,6 +837,7 @@ async function fatSecretSearch(search_expression) {
         search_expression,
         max_results: MAX_RESULTS,
         format: "json",
+        ...(FATSECRET_REGION ? { region: FATSECRET_REGION } : {}),
       },
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -785,10 +892,16 @@ async function tryUpgradeFromDb({
     };
   }
 
-  let pick = { index: -1, confidence: 0 };
+  let pick = { index: -1, confidence: 0, failed: true };
   try {
     pick = await pickBestCandidateIndex(query, top);
   } catch {}
+
+  // The picker looked and said none of these is the food asked for (say a
+  // different brand). Don't log the closest-sounding one anyway.
+  if (!pick.failed && pick.index < 0) {
+    return { upgraded: false, out: null, reason: "db_no_matching_candidate" };
+  }
 
   const chosen =
     pick.index >= 0 && pick.index < top.length ? top[pick.index] : bestDet.c;
@@ -1002,7 +1115,7 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
       });
       if (cleanedRetry.upgraded) return finish(cleanedRetry.out);
 
-      const aiResult = await aiResultPromise;
+      const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
       return finish(
         debug
           ? {
@@ -1022,7 +1135,7 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
       );
     }
 
-    const aiResult = await aiResultPromise;
+    const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
     return finish(
       debug
         ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
@@ -1030,7 +1143,7 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
     );
   } catch (err) {
     console.error("FatSecret resolve error:", err.response?.data || err.message || err);
-    const aiResult = await aiResultPromise;
+    const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
     return finish(
       debug
         ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
@@ -1498,7 +1611,7 @@ const COACH_SYSTEM_PROMPT = [
   "",
   "Always answer with a JSON object: {\"reply\": string, \"actions\": [ ... ]} (actions may be empty).",
   "Action types (at most 3 per answer):",
-  '- {"type":"log_food","meal":"Brekkie|Lunch|Dinner|Snacks","items":["2 large scrambled eggs","1 slice',
+  '- {"type":"log_food","meal":"Breakfast|Lunch|Dinner|Snacks","items":["2 large scrambled eggs","1 slice',
   '  wholemeal toast with butter"]}  items are plain food descriptions WITH amounts, one food each (max 10).',
   '- {"type":"log_recipe","recipe_id":"<id from context.recipes>","meal":"...","servings":1}',
   '- {"type":"remove_food","entry_ids":["<id from context.entries_today>", ...]}',
@@ -1506,11 +1619,11 @@ const COACH_SYSTEM_PROMPT = [
   '  "1 tbsp soy sauce", ...]}  ingredients for the WHOLE recipe, with amounts (max 20).',
   '- {"type":"delete_recipe","recipe_id":"<id from context.recipes>"}',
   "Only use ids that appear in the context. Diary changes are for today only. Pick the meal from what",
-  "they said, or the time of day if they didn't say (morning Brekkie, midday Lunch, evening Dinner,",
+  "they said, or the time of day if they didn't say (morning Breakfast, midday Lunch, evening Dinner,",
   "anything small between meals Snacks).",
 ].join("\n");
 
-const COACH_MEALS = ["Brekkie", "Lunch", "Dinner", "Snacks"];
+const COACH_MEALS = ["Breakfast", "Lunch", "Dinner", "Snacks"];
 
 // Keeps only well-formed actions that point at things the user really has.
 function sanitizeCoachActions(actions, context) {
@@ -1526,7 +1639,9 @@ function sanitizeCoachActions(actions, context) {
       .filter(Boolean)
   );
   const meal = (m) => {
-    const hit = COACH_MEALS.find((x) => x.toLowerCase() === String(m ?? "").toLowerCase());
+    let want = String(m ?? "").toLowerCase();
+    if (want === "brekkie") want = "breakfast"; // the app's old name for it
+    const hit = COACH_MEALS.find((x) => x.toLowerCase() === want);
     return hit || null;
   };
   const texts = (list, max) =>

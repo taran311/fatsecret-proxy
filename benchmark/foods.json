@@ -1,0 +1,30 @@
+{
+  "_about": "Reference values come from USDA FoodData Central, UK McCance & Widdowson (CoFID) or the brand's own label. Typical MyFitnessPal 'verified' entries are built from the same sources. Fill in the mfp_kcal column yourself (search the same text in MyFitnessPal) if you want a side-by-side.",
+  "foods": [
+    { "query": "1 medium banana", "kcal": 105, "protein": 1.3, "carbs": 27.0, "fat": 0.4, "ref": "USDA, 118g" },
+    { "query": "1 medium apple", "kcal": 95, "protein": 0.5, "carbs": 25.1, "fat": 0.3, "ref": "USDA, 182g" },
+    { "query": "150g cooked white rice", "kcal": 195, "protein": 4.0, "carbs": 42.3, "fat": 0.4, "ref": "USDA, long grain, cooked" },
+    { "query": "200g grilled chicken breast", "kcal": 330, "protein": 62.0, "carbs": 0.0, "fat": 7.2, "ref": "USDA, skinless, cooked" },
+    { "query": "150g cooked salmon fillet", "kcal": 309, "protein": 33.2, "carbs": 0.0, "fat": 18.5, "ref": "USDA, Atlantic farmed, cooked" },
+    { "query": "2 large eggs", "kcal": 143, "protein": 12.6, "carbs": 0.7, "fat": 9.5, "ref": "USDA, 2 x 50g" },
+    { "query": "1 tbsp olive oil", "kcal": 119, "protein": 0.0, "carbs": 0.0, "fat": 13.5, "ref": "USDA, 13.5g" },
+    { "query": "1 tbsp butter", "kcal": 102, "protein": 0.1, "carbs": 0.0, "fat": 11.5, "ref": "USDA, 14g" },
+    { "query": "1 tbsp peanut butter", "kcal": 94, "protein": 4.0, "carbs": 3.2, "fat": 8.0, "ref": "USDA, 16g" },
+    { "query": "30g almonds", "kcal": 174, "protein": 6.4, "carbs": 6.5, "fat": 15.0, "ref": "USDA" },
+    { "query": "40g porridge oats", "kcal": 150, "protein": 4.4, "carbs": 24.0, "fat": 3.2, "ref": "Oat label, ~374 kcal/100g" },
+    { "query": "2 Weetabix", "kcal": 136, "protein": 4.5, "carbs": 25.6, "fat": 0.8, "ref": "Weetabix UK label, 37.5g" },
+    { "query": "1 slice of white bread", "kcal": 85, "protein": 3.2, "carbs": 16.5, "fat": 0.6, "ref": "UK medium slice ~36g", "tolerance": 25 },
+    { "query": "100g cooked spaghetti", "kcal": 158, "protein": 5.8, "carbs": 30.9, "fat": 0.9, "ref": "USDA" },
+    { "query": "200g baked potato with skin", "kcal": 186, "protein": 5.0, "carbs": 42.2, "fat": 0.3, "ref": "USDA" },
+    { "query": "100g broccoli", "kcal": 34, "protein": 2.8, "carbs": 6.6, "fat": 0.4, "ref": "USDA, raw" },
+    { "query": "1 avocado", "kcal": 227, "protein": 2.7, "carbs": 11.8, "fat": 21.0, "ref": "USDA, Hass ~136g flesh", "tolerance": 25 },
+    { "query": "100g cheddar cheese", "kcal": 416, "protein": 25.4, "carbs": 0.1, "fat": 34.9, "ref": "UK CoFID" },
+    { "query": "250ml semi-skimmed milk", "kcal": 125, "protein": 9.0, "carbs": 12.0, "fat": 4.5, "ref": "UK label, 50 kcal/100ml" },
+    { "query": "200g Fage Total 0% Greek yogurt", "kcal": 108, "protein": 20.6, "carbs": 6.0, "fat": 0.0, "ref": "Fage UK label" },
+    { "query": "330ml can of Coca-Cola", "kcal": 139, "protein": 0.0, "carbs": 35.0, "fat": 0.0, "ref": "Coca-Cola UK label" },
+    { "query": "Mars bar", "kcal": 228, "protein": 2.2, "carbs": 35.2, "fat": 8.6, "ref": "Mars UK label, 51g" },
+    { "query": "yubi protein bar", "kcal": 99, "protein": 10.0, "carbs": 11.4, "fat": 3.2, "ref": "YuBi Bar Caramel label, 35g" },
+    { "query": "Big Mac", "kcal": 508, "protein": 26.0, "carbs": 43.0, "fat": 25.0, "ref": "McDonald's UK (via CalorieKing)" },
+    { "query": "175ml glass of red wine", "kcal": 150, "protein": 0.1, "carbs": 4.6, "fat": 0.0, "ref": "USDA, ~13% ABV", "tolerance": 20 }
+  ]
+}
