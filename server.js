@@ -6,9 +6,16 @@ import cors from "cors";
 import compression from "compression";
 import NodeCache from "node-cache";
 import OpenAI from "openai";
-import { initializeApp } from "firebase-admin/app";
+import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import rateLimit from "express-rate-limit";
+import { startReminders } from "./reminders.js";
+import {
+  registerBilling,
+  useCoachMessage,
+  refundCoachMessage,
+  isPremium,
+} from "./billing.js";
 
 dotenv.config();
 
@@ -41,15 +48,40 @@ app.use(
 // (base64) get a bigger limit, parsed only after the user is signed in.
 const smallJson = bodyParser.json({ limit: "20kb" });
 const photoJson = bodyParser.json({ limit: "6mb" });
+// Stripe's webhook needs the raw body (it's signed), so it skips this too.
 app.use((req, res, next) =>
-  req.path === "/food/photo" ? next() : smallJson(req, res, next)
+  req.path === "/food/photo" || req.path === "/billing/webhook"
+    ? next()
+    : smallJson(req, res, next)
 );
 
 // -------------------- Auth (Firebase ID tokens) --------------------
 // Verifying ID tokens only needs the project ID (Google's public keys are
-// fetched automatically), so no service-account secret is required.
+// fetched automatically). The evening reminders also read Firestore and
+// send pushes, which needs a service account: put its JSON (or the JSON
+// base64-encoded) in FIREBASE_SERVICE_ACCOUNT. Without it, reminders are off
+// and everything else works as before.
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "auth-af04a";
-initializeApp({ projectId: FIREBASE_PROJECT_ID });
+
+function readServiceAccount(raw) {
+  if (!raw) return null;
+  try {
+    const text = raw.trim().startsWith("{")
+      ? raw
+      : Buffer.from(raw, "base64").toString("utf8");
+    return JSON.parse(text);
+  } catch (err) {
+    console.error("FIREBASE_SERVICE_ACCOUNT isn't valid JSON:", err.message);
+    return null;
+  }
+}
+
+const SERVICE_ACCOUNT = readServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT);
+initializeApp(
+  SERVICE_ACCOUNT
+    ? { credential: cert(SERVICE_ACCOUNT), projectId: FIREBASE_PROJECT_ID }
+    : { projectId: FIREBASE_PROJECT_ID }
+);
 
 // Set REQUIRE_AUTH=false on Render only as a temporary escape hatch.
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH !== "false";
@@ -65,13 +97,16 @@ async function requireFirebaseUser(req, res, next) {
 
   try {
     const decoded = await getAuth().verifyIdToken(match[1]);
-    req.user = { uid: decoded.uid };
+    req.user = { uid: decoded.uid, email: decoded.email || null };
     return next();
   } catch (err) {
     console.warn("Rejected auth token:", err.code || err.message);
     return res.status(401).json({ error: "Invalid or expired auth token" });
   }
 }
+
+// -------------------- Premium (Stripe) --------------------
+registerBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 
 // Per-user limits (falls back to IP when auth is off). Keeps a leaked or
 // abusive client from running up the OpenAI / FatSecret bill.
@@ -1344,6 +1379,12 @@ const photoLimiter = rateLimit({
 });
 
 app.post("/food/photo", requireFirebaseUser, photoLimiter, photoJson, async (req, res) => {
+  if (!(await isPremium(req.user?.uid))) {
+    return res.status(402).json({
+      error: "Photo logging is part of Premium.",
+      code: "premium_required",
+    });
+  }
   const image = String(req.body?.image || "");
   const mime = String(req.body?.mime || "image/jpeg");
   if (!image || image.length > 5_500_000) {
@@ -1549,6 +1590,15 @@ app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
     return res.status(400).json({ error: "Ask me something first" });
   }
 
+  // Free accounts get a few Coach messages a day; Premium is unlimited.
+  const allowance = await useCoachMessage(req.user?.uid);
+  if (!allowance.allowed) {
+    return res.status(402).json({
+      error: "You've used today's free Coach messages. They reset at midnight.",
+      code: "coach_limit",
+    });
+  }
+
   const ctx = body.context && typeof body.context === "object" ? body.context : {};
   let context = "";
   try {
@@ -1582,14 +1632,27 @@ app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
       // Not JSON after all: treat the whole thing as the reply.
       parsed = { reply: response.output_text };
     }
-    const actions = sanitizeCoachActions(parsed.actions, ctx);
+    let actions = sanitizeCoachActions(parsed.actions, ctx);
     let reply = String(parsed.reply ?? "").trim();
     if (!reply && actions.length) reply = "Here's what I've put together. Have a look:";
     if (!reply) {
+      refundCoachMessage(req.user?.uid);
       return res.status(502).json({ error: "Coach is lost for words. Try again?" });
     }
-    return res.json({ reply, actions });
+    // Coach making changes for you is a Premium feature.
+    let lockedActions = 0;
+    if (!allowance.premium && actions.length) {
+      lockedActions = actions.length;
+      actions = [];
+    }
+    return res.json({
+      reply,
+      actions,
+      free_left: allowance.freeLeft,
+      locked_actions: lockedActions,
+    });
   } catch (err) {
+    refundCoachMessage(req.user?.uid);
     console.error("Coach error:", err?.response?.data || err.message || err);
     return res.status(502).json({ error: "Coach couldn't answer just now. Try again?" });
   }
@@ -1599,4 +1662,9 @@ app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  if (SERVICE_ACCOUNT && process.env.REMINDERS !== "off") {
+    startReminders();
+  } else {
+    console.log("[reminders] off (no FIREBASE_SERVICE_ACCOUNT)");
+  }
 });
