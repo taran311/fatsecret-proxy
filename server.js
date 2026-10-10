@@ -16,6 +16,7 @@ import {
   refundCoachMessage,
   isPremium,
 } from "./billing.js";
+import { registerAccount } from "./account.js";
 
 dotenv.config();
 
@@ -107,6 +108,7 @@ async function requireFirebaseUser(req, res, next) {
 
 // -------------------- Premium (Stripe) --------------------
 registerBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
+registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 
 // Per-user limits (falls back to IP when auth is off). Keeps a leaked or
 // abusive client from running up the OpenAI / FatSecret bill.
@@ -1229,14 +1231,15 @@ app.post("/macro-targets", requireFirebaseUser, macroLimiter, async (req, res) =
     const heightCm = Number(height_cm);
     const weightKg = Number(weight_kg);
 
-    if (!Number.isFinite(ageNum) || ageNum < 13 || ageNum > 90) {
-      return res.status(400).json({ error: "age must be 13–90" });
+    // Same limits as the app (lib/services/profile_limits.dart).
+    if (!Number.isFinite(ageNum) || ageNum < 13 || ageNum > 120) {
+      return res.status(400).json({ error: "age must be 13–120" });
     }
-    if (!Number.isFinite(heightCm) || heightCm < 120 || heightCm > 230) {
-      return res.status(400).json({ error: "height_cm must be 120–230" });
+    if (!Number.isFinite(heightCm) || heightCm < 100 || heightCm > 250) {
+      return res.status(400).json({ error: "height_cm must be 100–250" });
     }
-    if (!Number.isFinite(weightKg) || weightKg < 35 || weightKg > 250) {
-      return res.status(400).json({ error: "weight_kg must be 35–250" });
+    if (!Number.isFinite(weightKg) || weightKg < 30 || weightKg > 350) {
+      return res.status(400).json({ error: "weight_kg must be 30–350" });
     }
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
