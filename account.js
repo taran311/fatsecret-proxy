@@ -165,6 +165,20 @@ export async function deleteUserData(uid, { stripe } = {}) {
     )
   );
 
+  // Free their @username so someone else can have it.
+  await step(log, "username", async () => {
+    const user = (await db.collection("users").doc(uid).get()).data();
+    const handle = typeof user?.username === "string" ? user.username : "";
+    if (!handle) return "none";
+    const lock = db.collection("usernames").doc(handle);
+    const owner = (await lock.get()).data()?.uid;
+    if (owner === uid) await lock.delete();
+    return "freed";
+  });
+  await step(log, "usernames by uid", () =>
+    deleteQuery(db.collection("usernames").where("uid", "==", uid))
+  );
+
   // 4. Their single documents.
   for (const col of ["users", "user_achievements", "billing"]) {
     await step(log, `${col}/{uid}`, () => db.collection(col).doc(uid).delete());

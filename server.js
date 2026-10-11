@@ -17,6 +17,7 @@ import {
   isPremium,
 } from "./billing.js";
 import { registerAccount } from "./account.js";
+import { registerGames } from "./games.js";
 
 dotenv.config();
 
@@ -109,6 +110,7 @@ async function requireFirebaseUser(req, res, next) {
 // -------------------- Premium (Stripe) --------------------
 registerBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
+registerGames(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 
 // Per-user limits (falls back to IP when auth is off). Keeps a leaked or
 // abusive client from running up the OpenAI / FatSecret bill.
