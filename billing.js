@@ -6,8 +6,10 @@
 //                  current_period_end, cancel_at_period_end, founder,
 //                  stripe_customer_id, stripe_subscription_id,
 //                  coach_day, coach_count, trial_notice_sent
-//   users/{uid}.premium_until   mirror used to show the Premium card design
-//                               (to you and to friends looking at your card)
+//   users/{uid}.premium_until   end of the PAID plan (not the trial): unlocks
+//                               the Aurora card, for you and friends viewing it
+//   users/{uid}.aurora_given    Aurora was put on their card when they first
+//                               paid (once, so they can switch away)
 //   meta/billing.founders       how many early-supporter places are taken
 //
 // Env: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_MONTHLY,
@@ -74,20 +76,80 @@ export function entitlementFrom(data, now = new Date()) {
   return { premium: subscribed || inTrial, subscribed, inTrial, trialEnd, periodEnd };
 }
 
-/** The date Premium lasts until (for the card design mirror). */
-function premiumUntil(data, now = new Date()) {
+/**
+ * The date paid Premium lasts until, for the card design mirror. Only a
+ * paid plan counts: the Aurora card isn't part of the free trial.
+ */
+export function paidUntil(data, now = new Date()) {
   const e = entitlementFrom(data, now);
-  const dates = [];
-  if (e.subscribed && e.periodEnd) dates.push(e.periodEnd.getTime());
-  if (e.trialEnd) dates.push(e.trialEnd.getTime());
-  return dates.length ? new Date(Math.max(...dates)) : now;
+  return e.subscribed && e.periodEnd ? e.periodEnd : now;
+}
+
+const AURORA = "aurora";
+const DEFAULT_DESIGN = "midnight";
+
+/**
+ * What to change on users/{uid} so it matches their billing: the
+ * `premium_until` mirror (friends see your design from it), and, the first
+ * time someone is on a paid plan, Aurora on their card. That happens once
+ * (`aurora_given`), and only over the default design, so a design they
+ * picked themselves is kept and they can switch away from Aurora later.
+ * Returns null when nothing needs writing. Exported for tests.
+ */
+export function premiumMirrorUpdate(user, data, now = new Date()) {
+  const u = user || {};
+  const e = entitlementFrom(data, now);
+  const until = paidUntil(data, now);
+  const update = {};
+  const current = toDate(u.premium_until);
+  const stillPaid = e.subscribed;
+  const changed =
+    !current ||
+    (stillPaid
+      ? current.getTime() !== until.getTime()
+      : current.getTime() > now.getTime());
+  if (changed) update.premium_until = Timestamp.fromDate(until);
+  if (stillPaid && !u.aurora_given) {
+    update.aurora_given = true;
+    if (!u.card_design || u.card_design === DEFAULT_DESIGN) update.card_design = AURORA;
+  }
+  return Object.keys(update).length ? update : null;
 }
 
 async function mirrorPremium(uid, data) {
-  await userRef(uid).set(
-    { premium_until: Timestamp.fromDate(premiumUntil(data)) },
-    { merge: true }
-  );
+  const ref = userRef(uid);
+  await db().runTransaction(async (tx) => {
+    const user = (await tx.get(ref)).data();
+    const update = premiumMirrorUpdate(user, data);
+    if (update) tx.set(ref, update, { merge: true });
+  });
+}
+
+/**
+ * Brings every account's mirror up to date: run once at start-up, so paid
+ * members from before this change get Aurora, and trial accounts stop
+ * showing it to friends.
+ */
+async function backfillMirrors() {
+  let last = null;
+  let checked = 0;
+  for (;;) {
+    let q = db().collection("billing").orderBy("__name__").limit(200);
+    if (last) q = q.startAfter(last);
+    const snap = await q.get();
+    if (snap.empty) break;
+    for (const doc of snap.docs) {
+      try {
+        await mirrorPremium(doc.id, doc.data());
+        checked++;
+      } catch (err) {
+        console.error(`[billing] mirror ${doc.id} failed:`, err.message);
+      }
+    }
+    last = snap.docs[snap.docs.length - 1];
+    if (snap.size < 200) break;
+  }
+  console.log(`[billing] card mirrors checked: ${checked}`);
 }
 
 export async function isPremium(uid) {
@@ -439,6 +501,12 @@ export function registerBilling(app, { requireFirebaseUser, firestoreReady }) {
   });
 
   if (enabled) {
+    setTimeout(
+      () => backfillMirrors().catch((err) =>
+        console.error("[billing] mirror backfill failed:", err.message)
+      ),
+      30 * 1000
+    );
     const run = () =>
       sendTrialNotices().catch((err) =>
         console.error("[billing] trial notices failed:", err.message)
