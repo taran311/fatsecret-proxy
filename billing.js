@@ -4,6 +4,7 @@
 // Data (written only by this server; the app just reads it):
 //   billing/{uid}  trial_started_at, trial_ends_at, status, plan,
 //                  current_period_end, cancel_at_period_end, founder,
+//                  lifetime, lifetime_code (a redeemed gift code, gifts.js),
 //                  stripe_customer_id, stripe_subscription_id,
 //                  coach_day, coach_count, trial_notice_sent
 //   users/{uid}.premium_until   end of the PAID plan (not the trial): unlocks
@@ -70,10 +71,12 @@ export function entitlementFrom(data, now = new Date()) {
   const d = data || {};
   const periodEnd = toDate(d.current_period_end);
   const trialEnd = toDate(d.trial_ends_at);
+  const lifetime = d.lifetime === true;
   const subscribed =
-    PAID_STATES.has(d.status) && !!periodEnd && periodEnd.getTime() > now.getTime();
+    lifetime ||
+    (PAID_STATES.has(d.status) && !!periodEnd && periodEnd.getTime() > now.getTime());
   const inTrial = !subscribed && !!trialEnd && trialEnd.getTime() > now.getTime();
-  return { premium: subscribed || inTrial, subscribed, inTrial, trialEnd, periodEnd };
+  return { premium: subscribed || inTrial, subscribed, inTrial, lifetime, trialEnd, periodEnd };
 }
 
 /**
@@ -82,8 +85,12 @@ export function entitlementFrom(data, now = new Date()) {
  */
 export function paidUntil(data, now = new Date()) {
   const e = entitlementFrom(data, now);
+  if (e.lifetime) return LIFETIME_UNTIL;
   return e.subscribed && e.periodEnd ? e.periodEnd : now;
 }
+
+/// What a lifetime member's Premium "lasts until" on the card mirror.
+const LIFETIME_UNTIL = new Date("2100-01-01T00:00:00Z");
 
 const AURORA = "aurora";
 const DEFAULT_DESIGN = "midnight";
@@ -116,7 +123,7 @@ export function premiumMirrorUpdate(user, data, now = new Date()) {
   return Object.keys(update).length ? update : null;
 }
 
-async function mirrorPremium(uid, data) {
+export async function mirrorPremium(uid, data) {
   const ref = userRef(uid);
   await db().runTransaction(async (tx) => {
     const user = (await tx.get(ref)).data();
@@ -452,6 +459,9 @@ export function registerBilling(app, { requireFirebaseUser, firestoreReady }) {
       if (!price) return res.status(503).json({ error: "That plan isn't available yet." });
 
       const billing = (await billingRef(uid).get()).data() || {};
+      if (billing.lifetime === true) {
+        return res.status(409).json({ error: "You've got lifetime Premium already." });
+      }
       if (entitlementFrom(billing).subscribed) {
         return res.status(409).json({ error: "You're already subscribed." });
       }
