@@ -781,6 +781,9 @@ Return JSON:
           "- estimated_serving_grams: number\n" +
           "- ml: null\n\n" +
           "If neither is specified, estimate a realistic UK serving and use grams for solids and ml for drinks.\n\n" +
+          "For a number of items (\"3 biscuits\", \"2 rolls\", \"1 pear\"), use the standard size sold in UK " +
+          "supermarkets, not restaurant, takeaway or homemade sizes, unless the description says otherwise. " +
+          "For fruit and veg, count only the part that's eaten (no stone, skin or core) of a medium one.\n\n" +
           "Never assign grams to drinks when ml is appropriate.\n\n" +
           "Return realistic UK nutrition estimates.",
       },
@@ -858,7 +861,11 @@ async function webLookup(food, grams, ml) {
           '"serving_ml": number|null, "calories": number, "protein": number, "carbs": number, "fat": number, ' +
           '"calories_per_100g": number|null, "protein_per_100g": number|null, "carbs_per_100g": number|null, ' +
           '"fat_per_100g": number|null}\n' +
-          "calories/protein/carbs/fat are for ONE serving as sold (one bar, one pack, one bottle). " +
+          "calories/protein/carbs/fat are for EXACTLY the amount described: \"4 Jaffa Cakes\" is four cakes, " +
+          "\"2 Nakd bars\" is two bars. Labels often give a serving of several items, so work out the " +
+          "amount asked for from the per-item or per-100g values. If no amount is given, use one serving " +
+          "as sold (one bar, one pack, one bottle). serving_description says what the numbers are for, " +
+          "e.g. \"3 biscuits (33g)\". " +
           'If you can\'t find this product\'s label, reply {"found": false}.',
       },
       { role: "user", content: food },
@@ -889,19 +896,18 @@ async function webLookup(food, grams, ml) {
     };
   }
 
-  const count = !grams && !ml ? extractExplicitCount(food) : null;
-  const k = count && count > 1 ? count : 1;
+  // Already for the amount asked for ("3 Oreos"): no multiplying here.
   return {
     source: "web",
     mode: "serving",
     name: j.name || food,
-    grams: toPositiveNumberOrNull(j.serving_grams) ? toPositiveNumberOrNull(j.serving_grams) * k : null,
-    ml: toPositiveNumberOrNull(j.serving_ml) ? toPositiveNumberOrNull(j.serving_ml) * k : null,
+    grams: toPositiveNumberOrNull(j.serving_grams),
+    ml: toPositiveNumberOrNull(j.serving_ml),
     serving_description: j.serving_description,
-    calories: Math.round(Number(j.calories) * k),
-    protein: round1((Number(j.protein) || 0) * k),
-    carbs: round1((Number(j.carbs) || 0) * k),
-    fat: round1((Number(j.fat) || 0) * k),
+    calories: Math.round(Number(j.calories)),
+    protein: round1(Number(j.protein) || 0),
+    carbs: round1(Number(j.carbs) || 0),
+    fat: round1(Number(j.fat) || 0),
     confidence: 0.85,
   };
 }
@@ -994,6 +1000,14 @@ async function fatSecretSearch(search_expression) {
     if (err.response?.status !== 401) throw err;
     await refreshAccessToken();
     fsRes = await search();
+  }
+  // FatSecret reports problems (an IP address it doesn't allow, a bad
+  // token) as a normal reply with an "error" in it. Treat that as a
+  // failure, so it's logged and shows in the food check, rather than
+  // looking like "no matches".
+  const fsError = fsRes.data?.error;
+  if (fsError) {
+    throw new Error(`FatSecret ${fsError.code ?? ""}: ${fsError.message ?? "error"}`.trim());
   }
   const candidates = buildCandidates(fsRes.data);
   cache.set(cacheKey, candidates, RESOLVE_TTL_SECONDS);
@@ -1340,7 +1354,13 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
       source: r.source || "",
       name: r.name || "",
       portion: r.serving_description || (r.grams ? `${r.grams}g` : r.ml ? `${r.ml}ml` : ""),
-      why: r.debug?.reason || r.debug?.via || "",
+      why: [
+        r.debug?.reason || r.debug?.via,
+        r.debug?.primary?.reason && `first try: ${r.debug.primary.reason}`,
+        r.debug?.error,
+      ]
+        .filter(Boolean)
+        .join("; "),
     });
   } catch (err) {
     console.error("Food check failed:", err.message || err);
@@ -1354,7 +1374,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 4;
+const RESOLVE_VERSION = 5;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
