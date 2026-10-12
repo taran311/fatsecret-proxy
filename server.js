@@ -8,6 +8,8 @@ import NodeCache from "node-cache";
 import OpenAI from "openai";
 import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { createHash } from "node:crypto";
 import rateLimit from "express-rate-limit";
 import { startReminders } from "./reminders.js";
 import {
@@ -161,7 +163,7 @@ const FATSECRET_REGION = (process.env.FATSECRET_REGION || "").trim().toUpperCase
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
-// In-memory cache. Nutrition for "2 eggs" doesn't change, so successful
+// In-memory cache. Nutrition for "2 crumpets" doesn't change, so successful
 // lookups are kept for a week (until the server restarts); maxKeys stops it
 // growing without limit on the small Render instance.
 const cache = new NodeCache({ stdTTL: 300, maxKeys: 5000 });
@@ -231,7 +233,9 @@ app.get("/health", (req, res) => res.status(200).send("OK"));
 
 // -------------------- Config thresholds --------------------
 const MIN_AI_CONFIDENCE = 0.65;
-const MIN_DB_TOKEN_SCORE = 0.35;
+// Share of the food's own words (not amounts or units) that the database
+// entry's name must contain: both of "firm tofu", 2 of 3, 3 of 4.
+const MIN_DB_TOKEN_SCORE = 0.6;
 const MIN_DB_AI_PICK_CONF = 0.6;
 const MAX_RESULTS = 12;
 
@@ -248,26 +252,45 @@ function tokenize(s) {
   return normText(s).split(" ").filter(Boolean);
 }
 
-const LABEL_WORDS = new Set(["calories", "kcal", "fat", "carbs", "protein", "per"]);
+// Words that say how much, not what: left out when matching names.
+const AMOUNT_WORDS = new Set([
+  "g", "gram", "grams", "kg", "ml", "l", "litre", "liter", "cl", "oz", "lb",
+  "tbsp", "tablespoon", "tsp", "teaspoon", "cup", "slice", "can", "tin",
+  "bottle", "pack", "packet", "bag", "serving", "portion", "piece", "scoop",
+  "glass", "pint", "handful", "bowl", "small", "medium", "large", "regular",
+  "of", "a", "an", "the", "with", "x", "and", "half", "one", "two", "three",
+  "four", "five", "six",
+]);
 
+/** "crumpets" and "crumpet", "tomatoes" and "tomato", "berries" and "berry". */
+function stem(t) {
+  if (t.length > 4 && t.endsWith("ies")) return `${t.slice(0, -3)}y`;
+  if (t.length > 4 && /(ches|shes|xes|sses|oes)$/.test(t)) return t.slice(0, -2);
+  if (t.length > 2 && t.endsWith("s") && !t.endsWith("ss")) return t.slice(0, -1);
+  return t;
+}
+
+/** The words that name the food: no numbers, amounts or units, stemmed. */
+function foodWords(s) {
+  return [
+    ...new Set(
+      tokenize(s)
+        .map(stem)
+        .filter((t) => !/^\d/.test(t) && !AMOUNT_WORDS.has(t))
+    ),
+  ];
+}
+
+/**
+ * How well a database entry's name fits the food asked for: the share of
+ * the food's own words found in the entry's brand and name. "2 crumpets"
+ * and "Crumpet" score 1; "tofu curry" and "Tofu Scramble" score 0.5.
+ */
 function tokenScore(query, candidate) {
-  const qTokens = tokenize(query);
-  const q = new Set(qTokens);
-  if (!q.size) return 0;
-
-  // The description is FatSecret's label text ("Per 1 bar - Calories: ... |
-  // Protein: ..."), so words like "protein" or "fat" in it say nothing about
-  // which food it is. Each query word counts once.
-  const cTokens = new Set(
-    tokenize(
-      `${candidate.brand || ""} ${candidate.name || ""} ${candidate.description || ""}`
-    ).filter((t) => !LABEL_WORDS.has(t))
-  );
-
-  let hit = 0;
-  for (const t of cTokens) if (q.has(t)) hit++;
-
-  return hit / Math.max(4, qTokens.length);
+  const q = foodWords(query);
+  if (!q.length) return 0;
+  const c = new Set(foodWords(`${candidate.brand || ""} ${candidate.name || ""}`));
+  return q.filter((t) => c.has(t)).length / q.length;
 }
 
 function extractBrandHints(query) {
@@ -318,6 +341,12 @@ function cleanQueryForFatSecret(query, brandHints) {
 
   // remove explicit quantities like 400g, 330ml, 2l, etc.
   q = q.replace(/\b\d+(?:\.\d+)?\s*(g|gram|grams|ml|l)\b/g, " ");
+
+  // and a count at the start: "2 slices of toast" → "toast"
+  q = q.replace(
+    /^(?:\d+|a|an|one|two|three|four|five|six|half)\s+(?:(?:a|an)\s+)?(?:x\s+)?(?:(?:slices?|cans?|tins?|bottles?|packs?|packets?|bags?|bars?|cups?|mugs?|tbsp|tablespoons?|tsp|teaspoons?|servings?|portions?|pieces?|scoops?|glass(?:es)?|pints?)\s+)?(?:of\s+)?/,
+    " "
+  );
 
   // remove common size tokens that can hurt recall
   q = q.replace(
@@ -373,13 +402,47 @@ function extractExplicitMl(text) {
   return null;
 }
 
-function extractExplicitCount(text) {
-  // e.g. "3 bell peppers", "2 bananas"
-  // Only counts at the START, and only integers 1-20 to avoid weird cases.
-  const m = String(text).trim().match(/^(\d{1,2})\s+([a-zA-Z])/);
+const NUMBER_WORDS = {
+  a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+  eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, half: 0.5,
+};
+
+/** Units something can be counted in, by every name people use. */
+const COUNT_UNITS = {
+  slice: "slice", slices: "slice",
+  can: "can", cans: "can", tin: "can", tins: "can",
+  bottle: "bottle", bottles: "bottle",
+  pack: "pack", packs: "pack", packet: "pack", packets: "pack",
+  bag: "bag", bags: "bag",
+  bar: "bar", bars: "bar",
+  cup: "cup", cups: "cup", mug: "cup", mugs: "cup",
+  tbsp: "tbsp", tablespoon: "tbsp", tablespoons: "tbsp",
+  tsp: "tsp", teaspoon: "tsp", teaspoons: "tsp",
+  serving: "serving", servings: "serving", portion: "serving", portions: "serving",
+  piece: "piece", pieces: "piece",
+  scoop: "scoop", scoops: "scoop",
+  glass: "glass", glasses: "glass",
+  pint: "pint", pints: "pint",
+};
+
+/**
+ * "2 slices of toast" → { count: 2, unit: "slice" }; "3 crumpets" → { count: 3,
+ * unit: null }; "half an avocado" → { count: 0.5 }; "a banana" → 1.
+ * Only an amount at the start counts, and only 0.25-20 of something.
+ */
+function extractCountAndUnit(text) {
+  const t = String(text).toLowerCase().trim();
+  const m = t.match(
+    /^(\d+(?:\.\d+)?|[a-z]+)\s+(?:(?:a|an)\s+)?(?:x\s+)?(?:(?:small|medium|large|big|regular)\s+)?([a-z]+)/
+  );
   if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) && n >= 1 && n <= 20 ? n : null;
+  const n = /^\d/.test(m[1]) ? Number(m[1]) : NUMBER_WORDS[m[1]];
+  if (!Number.isFinite(n) || n < 0.25 || n > 20) return null;
+  return { count: n, unit: COUNT_UNITS[m[2]] || null };
+}
+
+function extractExplicitCount(text) {
+  return extractCountAndUnit(text)?.count ?? null;
 }
 
 function extractPerItemCount(desc) {
@@ -531,47 +594,108 @@ function buildCandidates(fsData) {
 }
 
 // -------------------- Deterministic scaling for DB candidate --------------------
-function scaleCandidate(candidate, grams, ml, count) {
-  const base = candidate.nutrition;
-  let factor = 1;
-  let mode = "serving";
-
-  if (grams && candidate.per_grams) {
-    factor = grams / candidate.per_grams;
-    mode = "weight";
-  } else if (ml && candidate.per_ml) {
-    factor = ml / candidate.per_ml;
-    mode = "volume";
-  } else if (!grams && !ml && count && candidate.per_item_count) {
-    factor = count / candidate.per_item_count;
-    mode = "serving";
-  }
-
-  return {
-    mode,
-    calories: Math.round(base.calories * factor),
-    protein: round1(base.protein * factor),
-    carbs: round1(base.carbs * factor),
-    fat: round1(base.fat * factor),
-    factor,
-  };
+/** FatSecret's serving: "Per 1 medium - Calories: …" → "1 medium". */
+function servingText(desc) {
+  const m = String(desc || "").match(/^\s*Per\s+(.+?)\s+-\s/i);
+  return m ? m[1].trim() : null;
 }
 
-function isScalingMismatch(candidate, grams, ml, query) {
-  if (grams && !candidate.per_grams && looksPerServingUnit(candidate.description)) {
-    // snack pack exception (crisps etc): "per pack" is acceptable even without per_grams
-    if (looksLikeSnackPackQuery(query, grams) && isBagOrPackServing(candidate.description)) {
-      return false;
+/** "Per 1 slice" → { n: 1, unit: "slice" }; "Per 2 biscuits" → { n: 2, unit: null }. */
+function perUnit(desc) {
+  const m = String(desc || "").match(/^\s*Per\s+(\d+(?:\.\d+)?)\s+([a-z]+)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!(n > 0)) return null;
+  return { n, unit: COUNT_UNITS[m[2].toLowerCase()] || null };
+}
+
+/** The entry is per a weight or volume ("Per 100g", "Per 250 ml"), not per item. */
+function isPerWeight(desc) {
+  return /^\s*Per\s+\d+(?:\.\d+)?\s*g\b/i.test(String(desc || ""));
+}
+function isPerVolume(desc) {
+  return /^\s*Per\s+\d+(?:\.\d+)?\s*(?:ml|fl\s*oz)\b/i.test(String(desc || ""));
+}
+
+/** Counted things that are one item each: "2 Nakd bars", "2 bags of crisps". */
+const ITEM_UNITS = new Set(["bar", "pack", "bag", "can", "bottle", "piece", "serving"]);
+
+function fmtAmount(n) {
+  return Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100);
+}
+
+/**
+ * How much of a database entry the food is: the factor to multiply its
+ * numbers by, plus the amount to show. Returns null when it can't be
+ * scaled reliably (the AI answer is used instead).
+ *
+ * [ai] is the AI estimate, used for its portion size when the entry is
+ * per 100g and the food doesn't say how much: "Tesco porridge oats" is
+ * the database's numbers for the AI's 40g, not 100g.
+ */
+function planScale(candidate, { grams, ml, count, unit, ai, query }) {
+  const desc = candidate.description;
+  const serving = servingText(desc);
+  const aiGrams = ai && !ai.failed ? toPositiveNumberOrNull(ai.grams) : null;
+  const aiMl = ai && !ai.failed ? toPositiveNumberOrNull(ai.ml) : null;
+  const byWeight = (g) => ({
+    factor: g / candidate.per_grams,
+    mode: "weight",
+    grams: Math.round(g),
+    ml: null,
+  });
+  const byVolume = (v) => ({
+    factor: v / candidate.per_ml,
+    mode: "volume",
+    grams: null,
+    ml: Math.round(v),
+  });
+
+  // "200g …" / "330ml …"
+  if (grams) {
+    if (candidate.per_grams) return byWeight(grams);
+    // Crisps: "25g bag" matches "per 1 bag".
+    if (looksLikeSnackPackQuery(query, grams) && isBagOrPackServing(desc)) {
+      return { factor: 1, mode: "serving", grams, ml: null, serving };
     }
-    return true;
+    return null;
   }
-  if (ml && !candidate.per_ml && looksPerServingUnit(candidate.description)) return true;
-  return false;
+  if (ml) return candidate.per_ml ? byVolume(ml) : null;
+
+  const pu = perUnit(desc);
+
+  // "2 slices of toast", "3 crumpets", "half an avocado"
+  if (count) {
+    const servings = (factor) => ({
+      factor,
+      mode: "serving",
+      grams: null,
+      ml: null,
+      serving: serving && factor !== 1 ? `${fmtAmount(factor)} × ${serving}` : serving,
+    });
+    if (unit) {
+      if (pu && pu.unit === unit) return servings(count / pu.n);
+    } else if (candidate.per_item_count) {
+      return servings(count / candidate.per_item_count);
+    } else if (pu && ITEM_UNITS.has(pu.unit)) {
+      return servings(count / pu.n);
+    }
+    // Per 100g: use the AI's weight for this many.
+    if (isPerWeight(desc) && candidate.per_grams && aiGrams) return byWeight(aiGrams);
+    if (isPerVolume(desc) && candidate.per_ml && aiMl) return byVolume(aiMl);
+    return null;
+  }
+
+  // No amount at all ("Tesco porridge oats", "banana").
+  if (isPerWeight(desc)) return candidate.per_grams && aiGrams ? byWeight(aiGrams) : null;
+  if (isPerVolume(desc)) return candidate.per_ml && aiMl ? byVolume(aiMl) : null;
+  // Already one item or serving ("Per 1 medium", "Per 1 bar").
+  return { factor: 1, mode: "serving", grams: null, ml: null, serving };
 }
 
-function isStrongGenericFallbackAllowed(query, candidate, token_score, grams, ml) {
-  if (!grams && !ml) return false;
-  if (token_score < 0.55) return false;
+function isStrongGenericFallbackAllowed(query, candidate, token_score, grams, ml, count) {
+  if (!grams && !ml && !count) return false;
+  if (token_score < 0.75) return false;
   if (grams && !candidate.per_grams) return false;
   if (ml && !candidate.per_ml) return false;
   return true;
@@ -883,6 +1007,7 @@ async function tryUpgradeFromDb({
   grams,
   ml,
   count,
+  unit,
   debug,
   brandHints,
   phaseLabel,
@@ -980,19 +1105,21 @@ async function tryUpgradeFromDb({
     };
   }
 
-  // Scaling veto
-  if (isScalingMismatch(chosen, grams, ml, query)) {
+  // How much: the amount asked for, or the AI's portion for an entry
+  // that's per 100g. Can't tell reliably: use the AI answer instead.
+  const scaled = planScale(chosen, { grams, ml, count, unit, ai: aiResult, query: originalFood });
+  if (!scaled || !(scaled.factor > 0) || scaled.factor > 50) {
     return {
       upgraded: false,
       out: null,
       reason: "db_scaling_mismatch_veto",
-      meta: { chosen: { name: chosen.name, brand: chosen.brand }, chosenScore },
+      meta: { chosen: { name: chosen.name, brand: chosen.brand, description: chosen.description }, chosenScore },
     };
   }
 
   // Cleaned retry accept rule
   if (phaseLabel === "cleaned_retry") {
-    if (!isStrongGenericFallbackAllowed(query, chosen, chosenScore, grams, ml)) {
+    if (!isStrongGenericFallbackAllowed(query, chosen, chosenScore, grams, ml, count)) {
       return {
         upgraded: false,
         out: null,
@@ -1002,18 +1129,18 @@ async function tryUpgradeFromDb({
     }
   }
 
-  const scaled = scaleCandidate(chosen, grams, ml, count);
-
+  const base = chosen.nutrition;
   const dbResult = {
     source: "fatsecret",
     mode: scaled.mode,
     name: chosen.brand ? `${chosen.brand} ${chosen.name}` : chosen.name,
-    grams: grams ?? null,
-    ml: ml ?? null,
-    calories: scaled.calories,
-    protein: scaled.protein,
-    carbs: scaled.carbs,
-    fat: scaled.fat,
+    grams: scaled.grams ?? null,
+    ml: scaled.ml ?? null,
+    ...(scaled.serving ? { serving_description: scaled.serving } : {}),
+    calories: Math.round(base.calories * scaled.factor),
+    protein: round1(base.protein * scaled.factor),
+    carbs: round1(base.carbs * scaled.factor),
+    fat: round1(base.fat * scaled.factor),
     confidence: 0.9,
     ...(debug
       ? {
@@ -1041,7 +1168,7 @@ async function tryUpgradeFromDb({
 }
 
 // -------------------- AI-first Hybrid Resolve --------------------
-/** Same food, same cache entry: "2 Eggs " and "2 eggs" share a lookup. */
+/** Same food, same cache entry: "2 Crumpets " and "2 crumpets" share a lookup. */
 function normalizeFood(food) {
   return String(food).trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -1076,10 +1203,36 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
     return res.status(400).json({ error: "Describe one food at a time" });
   }
 
-  const cacheKey = `resolve:v3:${normalizeFood(food)}`;
-  const cached = cache.get(cacheKey);
-  if (cached && !debug) return res.json(cached);
+  const key = normalizeFood(food);
+  const cacheKey = `resolve:v${RESOLVE_VERSION}:${key}`;
+  if (!debug) {
+    const cached = cache.get(cacheKey) || (await readSavedLookup(key));
+    if (cached) {
+      cache.set(cacheKey, cached, RESOLVE_TTL_SECONDS);
+      return res.json(cached);
+    }
+  }
 
+  // Only keep real answers. A failed lookup returns an error so the app
+  // can offer a retry, rather than silently logging 0 kcal (and
+  // remembering that 0).
+  const out = await resolveFood(food, { debug });
+  if (out.failed && !debug) {
+    return res.status(502).json({ error: "Couldn't look that up, try again" });
+  }
+  if (!debug) {
+    cache.set(cacheKey, out, RESOLVE_TTL_SECONDS);
+    saveLookup(key, food, out);
+  }
+  return res.json(out);
+});
+
+/**
+ * The hybrid lookup for one food: the AI estimate and the database
+ * search + pick run at the same time, so it takes about as long as the
+ * slower of the two, not both added up.
+ */
+async function resolveFood(food, { debug = false } = {}) {
   const aiResultPromise = estimateAI(food).catch((err) => {
     console.error("AI estimate failed:", err.response?.data || err.message || err);
     return aiFailure(food);
@@ -1087,86 +1240,98 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
 
   const grams = extractExplicitGrams(food);
   const ml = extractExplicitMl(food);
-  const count = !grams && !ml ? extractExplicitCount(food) : null;
+  const amount = !grams && !ml ? extractCountAndUnit(food) : null;
+  const count = amount?.count ?? null;
+  const unit = amount?.unit ?? null;
   const brandHints = extractBrandHints(food);
-
-  // Only cache real answers. A failed lookup returns an error so the app
-  // can offer a retry, rather than silently logging 0 kcal (and remembering
-  // that 0 for a week).
-  const finish = (out) => {
-    if (out.failed && !debug) {
-      return res.status(502).json({ error: "Couldn't look that up, try again" });
-    }
-    if (!debug) cache.set(cacheKey, out, RESOLVE_TTL_SECONDS);
-    return res.json(out);
-  };
+  const common = { originalFood: food, aiResultPromise, grams, ml, count, unit, debug, brandHints };
 
   try {
-    // Primary attempt
-    const primary = await tryUpgradeFromDb({
-      query: food,
-      originalFood: food,
-      aiResultPromise,
-      grams,
-      ml,
-      count,
-      debug,
-      brandHints,
-      phaseLabel: "primary",
-    });
-    if (primary.upgraded) return finish(primary.out);
+    const primary = await tryUpgradeFromDb({ ...common, query: food, phaseLabel: "primary" });
+    if (primary.upgraded) return primary.out;
 
     // ONE cleaned retry (hard-capped)
     const cleaned = cleanQueryForFatSecret(food, brandHints);
     if (cleaned && cleaned !== normText(food)) {
       const cleanedRetry = await tryUpgradeFromDb({
+        ...common,
         query: cleaned,
-        originalFood: food,
-        aiResultPromise,
-        grams,
-        ml,
-        debug,
-        brandHints,
         phaseLabel: "cleaned_retry",
       });
-      if (cleanedRetry.upgraded) return finish(cleanedRetry.out);
+      if (cleanedRetry.upgraded) return cleanedRetry.out;
 
       const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
-      return finish(
-        debug
-          ? {
-              ...aiResult,
-              debug: {
-                used: "ai_only",
-                reason: "db_upgrade_failed_after_one_retry",
-                primary: { reason: primary.reason, meta: primary.meta },
-                cleaned_retry: {
-                  query: cleaned,
-                  reason: cleanedRetry.reason,
-                  meta: cleanedRetry.meta,
-                },
-              },
-            }
-          : aiResult
-      );
+      return debug
+        ? {
+            ...aiResult,
+            debug: {
+              used: "ai_only",
+              reason: "db_upgrade_failed_after_one_retry",
+              primary: { reason: primary.reason, meta: primary.meta },
+              cleaned_retry: { query: cleaned, reason: cleanedRetry.reason, meta: cleanedRetry.meta },
+            },
+          }
+        : aiResult;
     }
 
     const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
-    return finish(
-      debug
-        ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
-        : aiResult
-    );
+    return debug
+      ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
+      : aiResult;
   } catch (err) {
     console.error("FatSecret resolve error:", err.response?.data || err.message || err);
     const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
-    return finish(
-      debug
-        ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
-        : aiResult
-    );
+    return debug
+      ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
+      : aiResult;
   }
-});
+}
+
+// -------------------- Saved lookups (Firestore) --------------------
+// The in-memory cache is wiped on every deploy, so answers are also kept
+// in Firestore: the same food gives the same numbers every time (not a
+// slightly different AI guess each week), and isn't paid for twice.
+// Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
+// looked up again. Server-only: under meta/, which the app can't read.
+const RESOLVE_VERSION = 4;
+const SAVED_LOOKUP_DAYS = 60;
+
+function savedLookups() {
+  return getFirestore().collection("meta").doc("food_cache").collection("items");
+}
+
+function savedLookupId(key) {
+  return createHash("sha1").update(key).digest("hex");
+}
+
+async function readSavedLookup(key) {
+  if (!SERVICE_ACCOUNT) return null;
+  try {
+    const snap = await savedLookups().doc(savedLookupId(key)).get();
+    const d = snap.data();
+    if (!d || d.version !== RESOLVE_VERSION || !d.result) return null;
+    const saved = d.saved_at?.toMillis?.() ?? 0;
+    if (Date.now() - saved > SAVED_LOOKUP_DAYS * 24 * 60 * 60 * 1000) return null;
+    return d.result;
+  } catch (err) {
+    console.warn("Saved lookup read failed:", err.message);
+    return null;
+  }
+}
+
+function saveLookup(key, food, result) {
+  if (!SERVICE_ACCOUNT) return;
+  savedLookups()
+    .doc(savedLookupId(key))
+    // Firestore refuses undefined fields; a JSON round trip drops them.
+    .set({
+      food: key,
+      version: RESOLVE_VERSION,
+      result: JSON.parse(JSON.stringify(result)),
+      saved_at: FieldValue.serverTimestamp(),
+    })
+    .catch((err) => console.warn("Saving lookup failed:", err.message));
+}
 
 // ======================================================================
 // ============================= MACRO TARGETS ===========================
@@ -1496,7 +1661,7 @@ app.get("/food/barcode", requireFirebaseUser, barcodeLimiter, async (req, res) =
 
 // -------------------- Contactless: meal photo --------------------
 // Turns a photo of a meal into a list of foods with portions, e.g.
-// ["150g grilled chicken breast", "1 cup white rice"]. The app then looks
+// ["150g grilled tofu", "1 cup white rice"]. The app then looks
 // each one up through /food/resolve like typed food, so the database
 // still gets first say on the numbers.
 const photoLimiter = rateLimit({
@@ -1539,7 +1704,7 @@ app.post("/food/photo", requireFirebaseUser, photoLimiter, photoJson, async (req
             "You identify food in photos for a calorie tracker. Return ONLY JSON: " +
             '{"items": ["<portion> <food>", ...]}. One entry per distinct food or drink, ' +
             "with a realistic portion estimate in grams, ml or units " +
-            '(e.g. "150g grilled chicken breast", "1 slice toast with butter", "330ml cola"). ' +
+            '(e.g. "150g grilled tofu", "1 slice toast with peanut butter", "330ml cola"). ' +
             "Include sauces and drinks you can see. At most 8 items. " +
             'If there is no food in the photo, return {"items": []}.',
         },
@@ -1633,7 +1798,7 @@ const COACH_SYSTEM_PROMPT = [
   "Changing their diary and recipes:",
   "You can PROPOSE changes; the app shows each one as a summary card with Accept / Reject, and nothing",
   "changes until the user accepts. Only propose a change when the user clearly asks for it (e.g. 'add 2",
-  "eggs to breakfast', 'log my chilli for dinner', 'remove the crisps', 'save this as a recipe'). If you",
+  "crumpets to breakfast', 'log my chilli for dinner', 'remove the crisps', 'save this as a recipe'). If you",
   "suggested a meal and they say 'add that', propose it. If something important is unclear (which meal,",
   "how much), ask instead of guessing wildly; otherwise use sensible everyday portions.",
   "In 'reply', say briefly what you've put together (e.g. 'Here you go, tap Accept to add it.'). Don't",
@@ -1642,11 +1807,11 @@ const COACH_SYSTEM_PROMPT = [
   "",
   "Always answer with a JSON object: {\"reply\": string, \"actions\": [ ... ]} (actions may be empty).",
   "Action types (at most 3 per answer):",
-  '- {"type":"log_food","meal":"Breakfast|Lunch|Dinner|Snacks","items":["2 large scrambled eggs","1 slice',
-  '  wholemeal toast with butter"]}  items are plain food descriptions WITH amounts, one food each (max 10).',
+  '- {"type":"log_food","meal":"Breakfast|Lunch|Dinner|Snacks","items":["150g scrambled tofu","1 slice',
+  '  wholemeal toast with vegan spread"]}  items are plain food descriptions WITH amounts, one food each (max 10).',
   '- {"type":"log_recipe","recipe_id":"<id from context.recipes>","meal":"...","servings":1}',
   '- {"type":"remove_food","entry_ids":["<id from context.entries_today>", ...]}',
-  '- {"type":"create_recipe","name":"Chicken stir fry","servings":2,"ingredients":["300g chicken breast",',
+  '- {"type":"create_recipe","name":"Tofu stir fry","servings":2,"ingredients":["300g firm tofu",',
   '  "1 tbsp soy sauce", ...]}  ingredients for the WHOLE recipe, with amounts (max 20).',
   '- {"type":"delete_recipe","recipe_id":"<id from context.recipes>"}',
   "Only use ids that appear in the context. Diary changes are for today only. Pick the meal from what",

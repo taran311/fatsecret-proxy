@@ -59,6 +59,7 @@ for (const [i, f] of foods.entries()) {
       ref_f: f.fat, our_f: round(Number(r.fat)),
       source: r.source || "",
       matched_name: r.name || "",
+      our_portion: r.serving_description || (r.grams ? `${r.grams}g` : r.ml ? `${r.ml}ml` : ""),
       ok: Math.abs(diff) <= tol && !r.failed,
       tolerance: tol,
       ref: f.ref,
@@ -67,7 +68,8 @@ for (const [i, f] of foods.entries()) {
     const flag = rows.at(-1).ok ? "ok  " : "MISS";
     console.log(
       `${flag} ${f.query.padEnd(34)} ref ${String(f.kcal).padStart(4)}  ours ${String(Math.round(kcal)).padStart(4)}` +
-        `  ${(diff >= 0 ? "+" : "") + round(diff)}%  [${r.source || "?"}] ${r.name || ""}`
+        `  ${(diff >= 0 ? "+" : "") + round(diff)}%  [${r.source || "?"}] ${r.name || ""}` +
+        (rows.at(-1).our_portion ? ` (${rows.at(-1).our_portion})` : "")
     );
   } catch (err) {
     rows.push({ query: f.query, ref_kcal: f.kcal, error: err.message, ok: false, ref: f.ref });
@@ -89,7 +91,7 @@ console.log(`Answered by: ${Object.entries(bySource).map(([k, v]) => `${k} ${v}`
 if (rows.length - done.length) console.log(`Errors: ${rows.length - done.length}`);
 
 const cols = ["query", "ref_kcal", "our_kcal", "kcal_diff_pct", "mfp_kcal", "ref_p", "our_p", "ref_c", "our_c",
-  "ref_f", "our_f", "source", "matched_name", "ok", "tolerance", "ref", "error"];
+  "ref_f", "our_f", "source", "matched_name", "our_portion", "ok", "tolerance", "ref", "error"];
 const esc = (v) => {
   const s = v === undefined || v === null ? "" : String(v);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
