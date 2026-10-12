@@ -820,7 +820,9 @@ calories/protein/carbs/fat are for the whole amount described. For a solid food,
   // something directly (a large egg as 90 rather than ~72).
   const per100 = j.per_100g;
   const servingGrams = toPositiveNumberOrNull(j.estimated_serving_grams);
-  if (!toPositiveNumberOrNull(j.ml) && !explicitMl && servingGrams &&
+  // Not for named brands or chains ("McPlant", "Greggs ..."): their own
+  // figure for the item is better than a generic weight guess.
+  if (!cleanBrand(j.brand) && !toPositiveNumberOrNull(j.ml) && !explicitMl && servingGrams &&
       per100 && Number(per100.calories) > 0) {
     const f = servingGrams / 100;
     j.calories = Number(per100.calories) * f;
@@ -957,16 +959,23 @@ const UNSURE = 0.6; // the app shows "Check this" below this
 async function aiOrWebResult(food, aiResultPromise, grams, ml) {
   const ai = await aiResultPromise;
   const unsure = !(Number(ai.confidence) >= UNSURE);
-  if (!WEB_LOOKUP || ai.failed || (!ai.brand && !unsure) || !process.env.OPENAI_API_KEY) {
+  // A chain or brand named in the text counts too, even if the model
+  // didn't fill in "brand" this time.
+  const named = !!ai.brand || extractBrandHints(food).length > 0;
+  if (!WEB_LOOKUP || ai.failed || (!named && !unsure) || !process.env.OPENAI_API_KEY) {
     return ai;
   }
-  try {
-    const web = await webLookup(food, grams, ml);
-    return web || ai;
-  } catch (err) {
-    console.error("Web lookup failed:", err.response?.data || err.message || err);
-    return ai;
+  // Web searches sometimes come back empty: one more try before settling
+  // for the estimate.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const web = await webLookup(food, grams, ml);
+      if (web) return web;
+    } catch (err) {
+      console.error("Web lookup failed:", err.response?.data || err.message || err);
+    }
   }
+  return ai;
 }
 
 // -------------------- AI: choose best DB candidate among top-N --------------------
@@ -1568,7 +1577,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 10;
+const RESOLVE_VERSION = 11;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
