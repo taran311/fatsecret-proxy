@@ -801,17 +801,33 @@ Return JSON:
   "protein": number,
   "carbs": number,
   "fat": number,
+  "per_100g": { "calories": number, "protein": number, "carbs": number, "fat": number } | null,
   "one_item": { "grams": number | null, "calories": number, "protein": number, "carbs": number, "fat": number } | null,
   "brand": string | null,
   "confidence": number
 }
-calories/protein/carbs/fat are for the whole amount described. If the description is a number of countable items ("3 biscuits", "half a pear", "2 rolls"), also fill "one_item" with the values for ONE single item (one biscuit, not one serving of several); otherwise set it to null.
+calories/protein/carbs/fat are for the whole amount described. For a solid food, also give "per_100g" (the values per 100g of it as eaten) and make "estimated_serving_grams" its realistic weight; for drinks set "per_100g" to null. If the description is a number of countable items ("3 biscuits", "half a pear", "2 rolls"), also fill "one_item" with the values for ONE single item (one biscuit, not one serving of several); otherwise set it to null.
 "brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null. People often type brand names in lower case: a word that isn't a food you recognise (e.g. "surreal", "grenade", "huel") is probably a UK brand or product, so put it in "brand" and keep "confidence" low unless you know that product's label.`,
       },
     ],
   });
 
   const j = JSON.parse(response.output_text);
+
+  // Solids: per-100g values × the estimated weight. The model is very
+  // accurate per 100g but tends to over-guess calories for "one of"
+  // something directly (a large egg as 90 rather than ~72).
+  const per100 = j.per_100g;
+  const servingGrams = toPositiveNumberOrNull(j.estimated_serving_grams);
+  if (!toPositiveNumberOrNull(j.ml) && !explicitMl && servingGrams &&
+      per100 && Number(per100.calories) > 0) {
+    const f = servingGrams / 100;
+    j.calories = Number(per100.calories) * f;
+    j.protein = (Number(per100.protein) || 0) * f;
+    j.carbs = (Number(per100.carbs) || 0) * f;
+    j.fat = (Number(per100.fat) || 0) * f;
+    if (j.one_item) j.one_item = null; // the total above is what's wanted
+  }
 
   // A number of items: one item's values times the number asked for, so
   // "3 Weetabix" is three biscuits (not one 2-biscuit serving) and half an
@@ -1466,7 +1482,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 7;
+const RESOLVE_VERSION = 8;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
