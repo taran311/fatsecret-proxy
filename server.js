@@ -806,7 +806,7 @@ Return JSON:
   "brand": string | null,
   "confidence": number
 }
-calories/protein/carbs/fat are for the whole amount described. For a solid food, also give "per_100g" (the values per 100g of it as eaten) and make "estimated_serving_grams" its realistic weight; for drinks set "per_100g" to null. If the description is a number of countable items ("3 biscuits", "half a pear", "2 rolls"), also fill "one_item" with the values for ONE single item (one biscuit, not one serving of several); otherwise set it to null.
+calories/protein/carbs/fat are for the whole amount described. For a solid food, also give "per_100g" (the values per 100g of it as eaten) and make "estimated_serving_grams" the realistic weight of the part that's eaten (no shell, stone, skin or packaging); for drinks set "per_100g" to null. If the description is a number of countable items ("3 biscuits", "half a pear", "2 rolls"), also fill "one_item" with the values for ONE single item (one biscuit, not one serving of several); otherwise set it to null.
 "brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null. People often type brand names in lower case: a word that isn't a food you recognise (e.g. "surreal", "grenade", "huel") is probably a UK brand or product, so put it in "brand" and keep "confidence" low unless you know that product's label.`,
       },
     ],
@@ -827,6 +827,7 @@ calories/protein/carbs/fat are for the whole amount described. For a solid food,
     j.carbs = (Number(per100.carbs) || 0) * f;
     j.fat = (Number(per100.fat) || 0) * f;
     if (j.one_item) j.one_item = null; // the total above is what's wanted
+    j._basis = `${Math.round(Number(per100.calories))} kcal/100g × ${Math.round(servingGrams)}g`;
   }
 
   // A number of items: one item's values times the number asked for, so
@@ -860,6 +861,7 @@ calories/protein/carbs/fat are for the whole amount described. For a solid food,
     fat: round1(Number(j.fat) || 0),
     confidence: Number.isFinite(Number(j.confidence)) ? Number(j.confidence) : 0.65,
     brand: cleanBrand(j.brand),
+    ...(j._basis ? { basis: j._basis } : {}),
   };
 }
 
@@ -1406,7 +1408,13 @@ async function resolveCounted(food, { debug = false } = {}) {
     protein: round1((Number(one.protein) || 0) * n),
     carbs: round1((Number(one.carbs) || 0) * n),
     fat: round1((Number(one.fat) || 0) * n),
-    ...(debug ? { debug: { via: `counted: ${n} × "${c.single}"`, single: one.debug } } : {}),
+    ...(debug
+      ? {
+          debug: {
+            via: `counted: ${n} × "${c.single}"${one.basis ? ` (${one.basis})` : ` (${one.source})`}`,
+          },
+        }
+      : {}),
   };
 }
 
@@ -1464,6 +1472,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
       portion: r.serving_description || (r.grams ? `${r.grams}g` : r.ml ? `${r.ml}ml` : ""),
       why: [
         r.debug?.reason || r.debug?.via,
+        r.basis && `worked out: ${r.basis}`,
         r.debug?.primary?.reason && `first try: ${r.debug.primary.reason}`,
         r.debug?.error,
       ]
@@ -1482,7 +1491,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 8;
+const RESOLVE_VERSION = 9;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
