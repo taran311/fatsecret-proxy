@@ -179,6 +179,14 @@ export async function deleteUserData(uid, { stripe } = {}) {
     deleteQuery(db.collection("usernames").where("uid", "==", uid))
   );
 
+  // Gift codes they redeemed stay used, but without their name.
+  await step(log, "gift codes", () =>
+    forEachDoc(
+      db.collection("meta").doc("gifts").collection("codes").where("redeemed_by", "==", uid),
+      (d) => d.ref.update({ redeemed_by: "deleted", redeemed_name: "Deleted account" })
+    )
+  );
+
   // 4. Their single documents.
   for (const col of ["users", "user_achievements", "billing"]) {
     await step(log, `${col}/{uid}`, () => db.collection(col).doc(uid).delete());
