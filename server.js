@@ -610,7 +610,7 @@ Return JSON:
   "brand": string | null,
   "confidence": number
 }
-"brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null.`,
+"brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null. People often type brand names in lower case: a word that isn't a food you recognise (e.g. "surreal", "grenade", "huel") is probably a UK brand or product, so put it in "brand" and keep "confidence" low unless you know that product's label.`,
         },
       ],
     });
@@ -676,7 +676,7 @@ Return JSON:
   "brand": string | null,
   "confidence": number
 }
-"brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null.`,
+"brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null. People often type brand names in lower case: a word that isn't a food you recognise (e.g. "surreal", "grenade", "huel") is probably a UK brand or product, so put it in "brand" and keep "confidence" low unless you know that product's label.`,
       },
     ],
   });
@@ -724,6 +724,8 @@ async function webLookup(food, grams, ml) {
         role: "system",
         content:
           "You find the official nutrition label for a branded food or drink sold in the UK. " +
+          "The description may give the brand in lower case or without saying what the product is " +
+          '(e.g. "40g surreal" is Surreal cereal): work out the product first. ' +
           "Search the web, prefer the brand's own site, a UK supermarket listing or a nutrition database " +
           "entry for that exact product. If no flavour is given, use the brand's standard or most common one. " +
           "Reply with ONLY a JSON object, no other text:\n" +
@@ -779,10 +781,18 @@ async function webLookup(food, grams, ml) {
   };
 }
 
-/** The AI estimate, or for a named brand the database missed, its real label. */
+/**
+ * The AI estimate, or the real label from the web: for a named brand the
+ * database missed, and whenever the model wasn't sure what the food is
+ * (e.g. a brand typed in lower case, like "40g surreal").
+ */
+const UNSURE = 0.6; // the app shows "Check this" below this
 async function aiOrWebResult(food, aiResultPromise, grams, ml) {
   const ai = await aiResultPromise;
-  if (!WEB_LOOKUP || ai.failed || !ai.brand || !process.env.OPENAI_API_KEY) return ai;
+  const unsure = !(Number(ai.confidence) >= UNSURE);
+  if (!WEB_LOOKUP || ai.failed || (!ai.brand && !unsure) || !process.env.OPENAI_API_KEY) {
+    return ai;
+  }
   try {
     const web = await webLookup(food, grams, ml);
     return web || ai;
@@ -1066,7 +1076,7 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
     return res.status(400).json({ error: "Describe one food at a time" });
   }
 
-  const cacheKey = `resolve:v2:${normalizeFood(food)}`;
+  const cacheKey = `resolve:v3:${normalizeFood(food)}`;
   const cached = cache.get(cacheKey);
   if (cached && !debug) return res.json(cached);
 
