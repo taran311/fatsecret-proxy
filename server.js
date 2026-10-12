@@ -1265,6 +1265,12 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
  * slower of the two, not both added up.
  */
 async function resolveFood(food, { debug = false } = {}) {
+  // "3 Weetabix", "half an avocado", "2 crumpets": one item, looked up
+  // once (and remembered), times the number. So a number of something
+  // always agrees with one of it, and gives the same answer every time.
+  const counted = await resolveCounted(food, { debug });
+  if (counted) return counted;
+
   const aiResultPromise = estimateAI(food).catch((err) => {
     console.error("AI estimate failed:", err.response?.data || err.message || err);
     return aiFailure(food);
@@ -1317,6 +1323,75 @@ async function resolveFood(food, { debug = false } = {}) {
       ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
       : aiResult;
   }
+}
+
+// -------------------- Counted foods --------------------
+/**
+ * "3 Weetabix" → { count: 3, single: "1 weetabix" }. Only a plain number of
+ * things (not "2 slices of", "a can of", "200g") and not 1 itself.
+ */
+function countedFood(food) {
+  if (extractExplicitGrams(food) || extractExplicitMl(food)) return null;
+  const amount = extractCountAndUnit(food);
+  if (!amount || amount.unit || amount.count === 1) return null;
+  const rest = String(food)
+    .trim()
+    .replace(
+      /^(?:\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|half)\s+(?:(?:a|an)\s+)?(?:x\s+)?/i,
+      ""
+    )
+    .trim();
+  if (!rest || rest.length < 2) return null;
+  // "2 large eggs" → "1 large egg"
+  const words = rest.split(/\s+/);
+  if (amount.count > 1) {
+    const last = words[words.length - 1];
+    const lower = last.toLowerCase();
+    const single = stem(lower);
+    if (single !== lower) {
+      words[words.length - 1] = lower.startsWith(single) ? last.slice(0, single.length) : single;
+    }
+  }
+  return { count: amount.count, single: `1 ${words.join(" ")}` };
+}
+
+/** A lookup through both caches (memory, then saved), saved when new. */
+async function cachedResolve(food) {
+  const key = normalizeFood(food);
+  const cacheKey = `resolve:v${RESOLVE_VERSION}:${key}`;
+  const cached = cache.get(cacheKey) || (await readSavedLookup(key));
+  if (cached) {
+    cache.set(cacheKey, cached, RESOLVE_TTL_SECONDS);
+    return cached;
+  }
+  const out = await resolveFood(food);
+  if (!out.failed) {
+    cache.set(cacheKey, out, RESOLVE_TTL_SECONDS);
+    saveLookup(key, food, out);
+  }
+  return out;
+}
+
+async function resolveCounted(food, { debug = false } = {}) {
+  const c = countedFood(food);
+  if (!c) return null;
+  const one = await cachedResolve(c.single);
+  if (one.failed || !(Number(one.calories) > 0)) return null;
+  const n = c.count;
+  const each = one.serving_description || (one.grams ? `${one.grams}g` : one.ml ? `${one.ml}ml` : "1");
+  const amountLabel = n === 0.5 ? "½" : String(Math.round(n * 100) / 100);
+  return {
+    ...one,
+    mode: "serving",
+    grams: one.grams ? Math.round(one.grams * n) : null,
+    ml: one.ml ? Math.round(one.ml * n) : null,
+    serving_description: `${amountLabel} × ${each}`,
+    calories: Math.round(Number(one.calories) * n),
+    protein: round1((Number(one.protein) || 0) * n),
+    carbs: round1((Number(one.carbs) || 0) * n),
+    fat: round1((Number(one.fat) || 0) * n),
+    ...(debug ? { debug: { via: `counted: ${n} × "${c.single}"`, single: one.debug } } : {}),
+  };
 }
 
 // -------------------- Food check (admins) --------------------
@@ -1391,7 +1466,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 6;
+const RESOLVE_VERSION = 7;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
