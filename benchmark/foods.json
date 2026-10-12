@@ -43,7 +43,7 @@
     { "query": "Greggs vegan sausage roll", "kcal": 312, "protein": 12.0, "carbs": 24.0, "fat": 19.0, "ref": "Greggs UK nutrition info (please confirm)", "tolerance": 15 },
     { "query": "200g grilled chicken breast", "kcal": 330, "protein": 62.0, "carbs": 0.0, "fat": 7.2, "ref": "USDA, skinless, cooked" },
     { "query": "150g cooked salmon fillet", "kcal": 309, "protein": 33.2, "carbs": 0.0, "fat": 18.5, "ref": "USDA, Atlantic farmed, cooked" },
-    { "query": "2 large eggs", "kcal": 143, "protein": 12.6, "carbs": 0.7, "fat": 9.5, "ref": "USDA, 2 x 50g" },
+    { "query": "2 large eggs", "kcal": 160, "protein": 14.0, "carbs": 0.2, "fat": 11.6, "ref": "UK large eggs (63-73g in shell, ~58g eaten each at ~138 kcal/100g); USDA's large egg is smaller (50g)" },
     { "query": "1 tbsp butter", "kcal": 102, "protein": 0.1, "carbs": 0.0, "fat": 11.5, "ref": "USDA, 14g" },
     { "query": "30g cheddar", "kcal": 125, "protein": 7.6, "carbs": 0.0, "fat": 10.5, "ref": "UK CoFID, 416 kcal/100g" },
     { "query": "250ml semi-skimmed milk", "kcal": 125, "protein": 9.0, "carbs": 12.0, "fat": 4.5, "ref": "UK label, 50 kcal/100ml" },

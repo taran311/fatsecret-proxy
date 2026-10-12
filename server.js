@@ -22,6 +22,7 @@ import { registerAccount } from "./account.js";
 import { registerGames } from "./games.js";
 import { registerGifts, isAdmin } from "./gifts.js";
 import { readFileSync } from "node:fs";
+import { STAPLES, DRINK_UNITS } from "./staples.js";
 
 dotenv.config();
 
@@ -1289,6 +1290,10 @@ async function resolveFood(food, { debug = false } = {}) {
   const counted = await resolveCounted(food, { debug });
   if (counted) return counted;
 
+  // An everyday UK food with label values on file: no guessing needed.
+  const staple = resolveStaple(food);
+  if (staple) return staple;
+
   const aiResultPromise = estimateAI(food).catch((err) => {
     console.error("AI estimate failed:", err.response?.data || err.message || err);
     return aiFailure(food);
@@ -1341,6 +1346,78 @@ async function resolveFood(food, { debug = false } = {}) {
       ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
       : aiResult;
   }
+}
+
+// -------------------- UK staples (label values) --------------------
+const STAPLE_INDEX = STAPLES.map((st) => ({
+  st,
+  keys: st.names.map((n) => foodWords(n).sort().join(" ")),
+}));
+
+/** The staple a food is, if its food words (not amounts) match exactly. */
+function findStaple(food) {
+  const key = foodWords(food).sort().join(" ");
+  if (!key) return null;
+  return STAPLE_INDEX.find((x) => x.keys.includes(key))?.st ?? null;
+}
+
+/** "250ml unsweetened soya milk", "1 slice of white bread", "a large egg". */
+function resolveStaple(food) {
+  const st = findStaple(food);
+  if (!st) return null;
+  const text = String(food).toLowerCase();
+  const grams = extractExplicitGrams(food);
+  const ml = extractExplicitMl(food);
+  const amount = !grams && !ml ? extractCountAndUnit(food) : null;
+
+  let size = null;
+  for (const s of Object.keys(st.sizes || {})) {
+    if (new RegExp(`\\b${s}\\b`).test(text)) size = s;
+  }
+  const itemWeight = size ? st.sizes[size] : st.item;
+
+  let qty; // grams, or ml for drinks
+  let portion;
+  if (st.drink) {
+    if (ml) {
+      qty = ml;
+    } else if (amount?.unit && DRINK_UNITS[amount.unit]) {
+      qty = amount.count * DRINK_UNITS[amount.unit];
+    } else if (grams) {
+      qty = grams;
+    } else if (!amount || !amount.unit) {
+      qty = st.serving * (amount?.count ?? 1);
+    } else {
+      return null; // "2 tbsp of milk" etc.: leave it to the usual lookup
+    }
+    portion = `${Math.round(qty)}ml`;
+  } else if (grams) {
+    qty = grams;
+    portion = `${Math.round(grams)}g`;
+  } else if (itemWeight && (!amount || !amount.unit || ["slice", "piece", "serving"].includes(amount.unit))) {
+    const n = amount?.count ?? 1;
+    qty = n * itemWeight;
+    const what = `${size ? `${size} ` : ""}${st.itemLabel || "item"}`;
+    portion = `${n === 1 ? "" : `${n} × `}${what} (${Math.round(itemWeight)}g)`;
+  } else {
+    return null;
+  }
+
+  const f = qty / 100;
+  return {
+    source: "label",
+    mode: st.drink ? "volume" : "weight",
+    name: st.label,
+    grams: st.drink ? null : Math.round(qty),
+    ml: st.drink ? Math.round(qty) : null,
+    serving_description: portion,
+    calories: Math.round(st.per100.kcal * f),
+    protein: round1(st.per100.protein * f),
+    carbs: round1(st.per100.carbs * f),
+    fat: round1(st.per100.fat * f),
+    confidence: 0.98,
+    basis: `${st.per100.kcal} kcal/100${st.drink ? "ml" : "g"} × ${Math.round(qty)}${st.drink ? "ml" : "g"} (UK label)`,
+  };
 }
 
 // -------------------- Counted foods --------------------
@@ -1491,7 +1568,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 9;
+const RESOLVE_VERSION = 10;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
