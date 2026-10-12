@@ -767,7 +767,7 @@ Return JSON:
   // Serving/volume-based
   const response = await openai.responses.create({
     model: AI_MODEL,
-    temperature: 0.05,
+    temperature: 0,
     text: { format: { type: "json_object" } },
     input: [
       {
@@ -801,15 +801,32 @@ Return JSON:
   "protein": number,
   "carbs": number,
   "fat": number,
+  "one_item": { "grams": number | null, "calories": number, "protein": number, "carbs": number, "fat": number } | null,
   "brand": string | null,
   "confidence": number
 }
+calories/protein/carbs/fat are for the whole amount described. If the description is a number of countable items ("3 biscuits", "half a pear", "2 rolls"), also fill "one_item" with the values for ONE single item (one biscuit, not one serving of several); otherwise set it to null.
 "brand" is the brand or chain if the description names one (e.g. "Yubi", "Greggs", "Tesco"), otherwise null. People often type brand names in lower case: a word that isn't a food you recognise (e.g. "surreal", "grenade", "huel") is probably a UK brand or product, so put it in "brand" and keep "confidence" low unless you know that product's label.`,
       },
     ],
   });
 
   const j = JSON.parse(response.output_text);
+
+  // A number of items: one item's values times the number asked for, so
+  // "3 Weetabix" is three biscuits (not one 2-biscuit serving) and half an
+  // avocado is always half of a whole one.
+  const amount = explicitMl ? null : extractCountAndUnit(food);
+  const one = j.one_item;
+  if (amount && !amount.unit && one && Number(one.calories) > 0) {
+    const n = amount.count;
+    j.calories = Number(one.calories) * n;
+    j.protein = (Number(one.protein) || 0) * n;
+    j.carbs = (Number(one.carbs) || 0) * n;
+    j.fat = (Number(one.fat) || 0) * n;
+    const g = toPositiveNumberOrNull(one.grams);
+    if (g) j.estimated_serving_grams = g * n;
+  }
 
   // Prefer explicit ml from input if model left it blank
   const ml = toPositiveNumberOrNull(j.ml) ?? explicitMl;
@@ -1374,7 +1391,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 5;
+const RESOLVE_VERSION = 6;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
