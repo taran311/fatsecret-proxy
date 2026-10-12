@@ -20,7 +20,8 @@ import {
 } from "./billing.js";
 import { registerAccount } from "./account.js";
 import { registerGames } from "./games.js";
-import { registerGifts } from "./gifts.js";
+import { registerGifts, isAdmin } from "./gifts.js";
+import { readFileSync } from "node:fs";
 
 dotenv.config();
 
@@ -1286,6 +1287,66 @@ async function resolveFood(food, { debug = false } = {}) {
       : aiResult;
   }
 }
+
+// -------------------- Food check (admins) --------------------
+// The foods in benchmark/foods.json, looked up live one at a time by the
+// app's admin-only Food check screen, so lookup accuracy can be checked on
+// the real server without setting anything up. Skips the saved answers,
+// so it always tests the current lookup.
+const FOOD_CHECK = (() => {
+  try {
+    const raw = readFileSync(new URL("./benchmark/foods.json", import.meta.url), "utf8");
+    return JSON.parse(raw).foods || [];
+  } catch (err) {
+    console.warn("Food check list not loaded:", err.message);
+    return [];
+  }
+})();
+
+app.get("/admin/food-check", requireFirebaseUser, (req, res) => {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: "Not allowed." });
+  res.json({
+    foods: FOOD_CHECK.map((f) => ({
+      query: f.query,
+      kcal: f.kcal,
+      protein: f.protein,
+      carbs: f.carbs,
+      fat: f.fat,
+      ref: f.ref || "",
+      tolerance: f.tolerance ?? 15,
+    })),
+  });
+});
+
+app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (req, res) => {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: "Not allowed." });
+  const index = Number(req.body?.index);
+  const f = Number.isInteger(index) ? FOOD_CHECK[index] : null;
+  if (!f) return res.status(400).json({ error: "No food at that number." });
+  try {
+    const r = await resolveFood(f.query, { debug: true });
+    const kcal = Number(r.calories) || 0;
+    const diff = f.kcal ? ((kcal - f.kcal) / f.kcal) * 100 : 0;
+    const tolerance = f.tolerance ?? 15;
+    res.json({
+      index,
+      kcal: Math.round(kcal),
+      protein: round1(Number(r.protein) || 0),
+      carbs: round1(Number(r.carbs) || 0),
+      fat: round1(Number(r.fat) || 0),
+      diff: round1(diff),
+      ok: !r.failed && Math.abs(diff) <= tolerance,
+      failed: !!r.failed,
+      source: r.source || "",
+      name: r.name || "",
+      portion: r.serving_description || (r.grams ? `${r.grams}g` : r.ml ? `${r.ml}ml` : ""),
+      why: r.debug?.reason || r.debug?.via || "",
+    });
+  } catch (err) {
+    console.error("Food check failed:", err.message || err);
+    res.status(502).json({ error: "Lookup failed" });
+  }
+});
 
 // -------------------- Saved lookups (Firestore) --------------------
 // The in-memory cache is wiped on every deploy, so answers are also kept
