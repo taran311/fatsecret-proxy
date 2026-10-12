@@ -23,6 +23,7 @@
 import express from "express";
 import Stripe from "stripe";
 import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { countEvent } from "./analytics.js";
 import { getMessaging } from "firebase-admin/messaging";
 
 const APP_URL = process.env.APP_URL || "https://thecaloriecard.com/";
@@ -123,13 +124,15 @@ export function premiumMirrorUpdate(user, data, now = new Date()) {
   return Object.keys(update).length ? update : null;
 }
 
-export async function mirrorPremium(uid, data) {
+export async function mirrorPremium(uid, data, { count = true } = {}) {
   const ref = userRef(uid);
-  await db().runTransaction(async (tx) => {
+  const firstPaid = await db().runTransaction(async (tx) => {
     const user = (await tx.get(ref)).data();
     const update = premiumMirrorUpdate(user, data);
     if (update) tx.set(ref, update, { merge: true });
+    return !!update?.aurora_given; // first time on a paid plan
   });
+  if (firstPaid && count) countEvent("premium_started");
 }
 
 /**
@@ -147,7 +150,7 @@ async function backfillMirrors() {
     if (snap.empty) break;
     for (const doc of snap.docs) {
       try {
-        await mirrorPremium(doc.id, doc.data());
+        await mirrorPremium(doc.id, doc.data(), { count: false });
         checked++;
       } catch (err) {
         console.error(`[billing] mirror ${doc.id} failed:`, err.message);

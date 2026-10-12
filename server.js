@@ -21,6 +21,7 @@ import {
 import { registerAccount } from "./account.js";
 import { registerGames } from "./games.js";
 import { registerGifts, isAdmin } from "./gifts.js";
+import { registerAnalytics, countEvent } from "./analytics.js";
 import { readFileSync } from "node:fs";
 import { STAPLES, DRINK_UNITS } from "./staples.js";
 
@@ -117,6 +118,7 @@ registerBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT })
 registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerGames(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerGifts(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
+registerAnalytics(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 
 // Per-user limits (falls back to IP when auth is off). Keeps a leaked or
 // abusive client from running up the OpenAI / FatSecret bill.
@@ -1265,6 +1267,7 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
 
   const key = normalizeFood(food);
   const cacheKey = `resolve:v${RESOLVE_VERSION}:${key}`;
+  if (!debug) countEvent("food_lookup");
   if (!debug) {
     const cached = cache.get(cacheKey) || (await readSavedLookup(key));
     if (cached) {
@@ -2193,6 +2196,7 @@ app.post("/coach", requireFirebaseUser, coachLimiter, async (req, res) => {
       code: "coach_limit",
     });
   }
+  countEvent("coach_message");
 
   const ctx = body.context && typeof body.context === "object" ? body.context : {};
   let context = "";

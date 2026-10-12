@@ -24,6 +24,7 @@ import crypto from "node:crypto";
 import rateLimit from "express-rate-limit";
 import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 import { mirrorPremium } from "./billing.js";
+import { countEvent } from "./analytics.js";
 
 // No 0/O, 1/I/L or U, so codes are easy to read out and type.
 const ALPHABET = "23456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -229,7 +230,8 @@ export function registerGifts(app, { requireFirebaseUser, firestoreReady }) {
       }
 
       // Aurora on their card, and the mirror friends see.
-      await mirrorPremium(uid, outcome.billing).catch((err) =>
+      countEvent("gift_redeemed");
+      await mirrorPremium(uid, outcome.billing, { count: false }).catch((err) =>
         console.error("[gift/redeem] mirror failed:", err.message || err)
       );
       const b = outcome.billing;
