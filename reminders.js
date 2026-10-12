@@ -6,6 +6,10 @@
 // whether they've logged anything today, and if not send one friendly
 // push. reminder_last_sent (a local yyyy-mm-dd) makes sure it's once a day.
 //
+// An hour later, people who DID log food but haven't closed the day get a
+// "close today" nudge, so a forgotten tap doesn't cost them their streak
+// (close_reminder_last_sent, once a day). Rest days get neither.
+//
 // Needs firebase-admin initialised with a service account (see server.js).
 
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
@@ -32,6 +36,11 @@ const MESSAGES = [
     body: "A quick log keeps your streak alive. Ask the Coach if you're short on time.",
   },
 ];
+
+const CLOSE_MESSAGE = {
+  title: "Close today? ✅",
+  body: "You've logged today's food. Close your day so it counts towards your streak.",
+};
 
 const DEAD_TOKEN_CODES = new Set([
   "messaging/registration-token-not-registered",
@@ -68,11 +77,19 @@ function cleanHour(v) {
   return Number.isInteger(n) && n >= 0 && n < 24 ? n : 20;
 }
 
-/** Has this person logged any food (not recipe ingredients) today? */
-async function loggedToday(db, uid, day) {
+/**
+ * Where this person's day stands: closed (finished), a rest day, and
+ * whether they've logged any food (not recipe ingredients).
+ */
+async function dayState(db, uid, day) {
   const log = await db.collection("daily_logs").doc(`${uid}_${day.key}`).get();
-  if (log.exists && log.get("finished") === true) return true;
+  const finished = log.exists && log.get("finished") === true;
+  const rest = log.exists && log.get("rest_day") === true;
+  if (finished) return { finished, rest, logged: true };
+  return { finished, rest, logged: await hasFoodToday(db, uid, day) };
+}
 
+async function hasFoodToday(db, uid, day) {
   const isEntry = (data) => data.foodCategory !== "Recipe";
   try {
     const snap = await db
@@ -118,14 +135,27 @@ export async function sendDueReminders(now = new Date()) {
         if (!tokens.length) continue;
 
         const day = localDay(now, cleanOffset(data.tz_offset_minutes));
-        if (day.hour !== cleanHour(data.reminder_hour)) continue;
-        if (data.reminder_last_sent === day.key) continue;
+        const hour = cleanHour(data.reminder_hour);
+        let msg = null;
+        let tag = "log-reminder";
+        if (day.hour === hour) {
+          if (data.reminder_last_sent === day.key) continue;
+          // Mark first, so a slow send or a restart can't double up.
+          await doc.ref.update({ reminder_last_sent: day.key });
+          const state = await dayState(db, doc.id, day);
+          if (state.logged || state.rest) continue;
+          msg = MESSAGES[day.dayOfYear % MESSAGES.length];
+        } else if (day.hour === Math.min(23, hour + 1)) {
+          if (data.close_reminder_last_sent === day.key) continue;
+          await doc.ref.update({ close_reminder_last_sent: day.key });
+          const state = await dayState(db, doc.id, day);
+          if (!state.logged || state.finished || state.rest) continue;
+          msg = CLOSE_MESSAGE;
+          tag = "close-reminder";
+        } else {
+          continue;
+        }
 
-        // Mark first, so a slow send or a restart can't double up.
-        await doc.ref.update({ reminder_last_sent: day.key });
-        if (await loggedToday(db, doc.id, day)) continue;
-
-        const msg = MESSAGES[day.dayOfYear % MESSAGES.length];
         const res = await getMessaging().sendEachForMulticast({
           tokens,
           notification: { title: msg.title, body: msg.body },
@@ -134,11 +164,11 @@ export async function sendDueReminders(now = new Date()) {
               title: msg.title,
               body: msg.body,
               icon: new URL("icons/Icon-192.png", APP_URL).toString(),
-              tag: "log-reminder",
+              tag,
             },
             fcmOptions: { link: APP_URL },
           },
-          android: { notification: { tag: "log-reminder" } },
+          android: { notification: { tag } },
         });
         sent += res.successCount;
 
