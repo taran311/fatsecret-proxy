@@ -10,7 +10,7 @@
 
 import rateLimit from "express-rate-limit";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 import { isAdmin } from "./gifts.js";
 
 let enabled = false;
@@ -43,6 +43,31 @@ export function countEvent(event, n = 1) {
     .catch((err) => console.warn("Counting", event, "failed:", err.message));
 }
 
+/** How often a person's "last seen" time is saved. */
+const SEEN_EVERY_MS = 5 * 60 * 1000;
+
+/** A display name from a users doc: the one they chose, or their email's start. */
+function nameOf(user) {
+  const chosen = String(user?.display_name || "").trim();
+  if (chosen) return chosen;
+  const email = String(user?.email || "");
+  const at = email.indexOf("@");
+  return at > 0 ? email.slice(0, at) : "Unknown";
+}
+
+const iso = (t) => {
+  if (!t) return null;
+  const d = typeof t.toDate === "function" ? t.toDate() : new Date(t);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+};
+
+/** The later of two ISO times (either may be null). Exported for tests. */
+export function latest(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  return a > b ? a : b;
+}
+
 /** What the app may report. */
 const CLIENT_EVENTS = new Set(["active", "card_created", "food_logged", "day_closed"]);
 
@@ -71,10 +96,17 @@ export function registerAnalytics(app, { requireFirebaseUser, firestoreReady }) 
         const a = (await tx.get(userRef)).data()?.analytics || {};
         const out = [];
         const mark = {};
+        // When they were last using the app (for the admin People list;
+        // see the privacy policy). Saved at most every few minutes.
+        const nowMs = Date.now();
+        const seenMs = a.last_seen_at?.toMillis?.() ?? 0;
+        if (nowMs - seenMs >= SEEN_EVERY_MS) mark.last_seen_at = Timestamp.fromMillis(nowMs);
         if (event === "active") {
-          if (a.last_active === today) return out; // once a day each
-          mark.last_active = today;
-          out.push("active");
+          if (a.last_active !== today) {
+            // Counted once a day each.
+            mark.last_active = today;
+            out.push("active");
+          }
         } else if (event === "card_created") {
           if (a.card_created) return out; // once ever
           mark.card_created = today;
@@ -105,6 +137,55 @@ export function registerAnalytics(app, { requireFirebaseUser, firestoreReady }) 
     } catch (err) {
       console.warn("Track failed:", err.message);
       res.json({ ok: false });
+    }
+  });
+
+  // Admin only: everyone with a card, most recently active first, with
+  // when they were last using the app.
+  app.get("/admin/users", requireFirebaseUser, async (req, res) => {
+    if (!isAdmin(req.user)) return res.status(403).json({ error: "Not allowed." });
+    if (!enabled) return res.status(503).json({ error: "Not available right now." });
+    try {
+      const snap = await getFirestore()
+        .collection("users")
+        .select("display_name", "email", "username", "analytics")
+        .get();
+      // Sign-in records: when they joined, and when the app last renewed
+      // their sign-in (roughly hourly while it's open), which also covers
+      // people from before "last seen" was saved.
+      const auth = new Map();
+      try {
+        let pageToken;
+        do {
+          const page = await getAuth().listUsers(1000, pageToken);
+          for (const u of page.users) {
+            auth.set(u.uid, {
+              joined: u.metadata.creationTime,
+              refreshed: u.metadata.lastRefreshTime,
+            });
+          }
+          pageToken = page.pageToken;
+        } while (pageToken && auth.size < 10000);
+      } catch (err) {
+        console.warn("Listing sign-ins failed:", err.message);
+      }
+      const users = snap.docs.map((d) => {
+        const u = d.data() || {};
+        const a = u.analytics || {};
+        const m = auth.get(d.id) || {};
+        return {
+          uid: d.id,
+          name: nameOf(u),
+          username: u.username || null,
+          joined: iso(m.joined),
+          last_seen: latest(iso(a.last_seen_at), iso(m.refreshed)),
+        };
+      });
+      users.sort((x, y) => String(y.last_seen || "").localeCompare(String(x.last_seen || "")));
+      res.json({ users });
+    } catch (err) {
+      console.error("People list failed:", err.message);
+      res.status(500).json({ error: "Couldn't load people." });
     }
   });
 
