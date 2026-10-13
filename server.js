@@ -24,7 +24,6 @@ import { registerChat } from "./chat.js";
 import { registerGifts, isAdmin } from "./gifts.js";
 import { registerAnalytics, countEvent } from "./analytics.js";
 import { readFileSync } from "node:fs";
-import { STAPLES, DRINK_UNITS } from "./staples.js";
 
 dotenv.config();
 
@@ -299,29 +298,13 @@ function tokenScore(query, candidate) {
   return q.filter((t) => c.has(t)).length / q.length;
 }
 
-function extractBrandHints(query) {
-  const q = normText(query);
-  const hints = [];
-
-  // small list: only for obvious brand mismatch protection
-  const known = [
-    "greggs",
-    "walkers",
-    "tesco",
-    "costa",
-    "mcdonald",
-    "mcdonalds",
-    "coca",
-    "coca cola",
-    "coca-cola",
-    "alpro",
-    "chiquita",
-  ];
-
-  for (const k of known) {
-    if (q.includes(k)) hints.push(k);
-  }
-  return hints;
+/**
+ * The words of a brand the AI found in the food ("McCain", "Tesco
+ * Finest"), for checking a database entry is that brand. No list of
+ * brands: any brand works the same way.
+ */
+function brandWords(brand) {
+  return normText(brand || "").split(" ").filter((w) => w.length > 1);
 }
 
 function containsAllKeywords(haystack, words) {
@@ -361,24 +344,6 @@ function cleanQueryForFatSecret(query, brandHints) {
   );
 
   return q.replace(/\s+/g, " ").trim();
-}
-
-// coffee-shop intent + capsule/pod veto
-function hasCoffeeShopIntent(query) {
-  const q = normText(query);
-  const sizeSignals =
-    /\b(small|medium|large|grande|venti|tall)\b/.test(q) ||
-    /\b(costa|starbucks|caffe|café|coffee shop)\b/.test(q);
-  const drinkSignals = /\b(latte|cappuccino|flat white|americano|mocha)\b/.test(q);
-  return sizeSignals && drinkSignals;
-}
-
-function isCapsuleOrInstantDrinkCandidate(candidateText) {
-  const t = normText(candidateText);
-  return (
-    /\b(tassimo|nespresso|dolce|gusto|keurig|pod|pods|capsule|capsules)\b/.test(t) ||
-    /\b(instant|powder|sachet|mug)\b/.test(t)
-  );
 }
 
 // -------------------- Quantity extractors --------------------
@@ -521,29 +486,6 @@ function looksPerServingUnit(desc) {
   return false;
 }
 
-function looksLikeSnackPackQuery(query, grams) {
-  if (!grams) return false;
-  if (grams < 20 || grams > 100) return false;
-  const q = normText(query);
-  return (
-    q.includes("crisps") ||
-    q.includes("chips") ||
-    q.includes("snack") ||
-    q.includes("bag") ||
-    q.includes("pack")
-  );
-}
-
-function isBagOrPackServing(desc) {
-  const d = normText(desc);
-  return (
-    d.includes("per 1 bag") ||
-    d.includes("per 1 pack") ||
-    d.includes("per bag") ||
-    d.includes("per pack")
-  );
-}
-
 // -------------------- Nutrition parser --------------------
 function parseNutrition(desc) {
   const d = String(desc || "");
@@ -659,12 +601,9 @@ function planScale(candidate, { grams, ml, count, unit, ai, query }) {
 
   // "200g …" / "330ml …"
   if (grams) {
-    if (candidate.per_grams) return byWeight(grams);
-    // Crisps: "25g bag" matches "per 1 bag".
-    if (looksLikeSnackPackQuery(query, grams) && isBagOrPackServing(desc)) {
-      return { factor: 1, mode: "serving", grams, ml: null, serving };
-    }
-    return null;
+    // An entry without a weight can't be scaled to one: the label lookup
+    // or the AI answers instead.
+    return candidate.per_grams ? byWeight(grams) : null;
   }
   if (ml) return candidate.per_ml ? byVolume(ml) : null;
 
@@ -980,17 +919,10 @@ async function webLookup(food, grams, ml) {
  * (e.g. a brand typed in lower case, like "40g surreal").
  */
 const UNSURE = 0.6; // the app shows "Check this" below this
-async function aiOrWebResult(food, aiResultPromise, grams, ml) {
-  const ai = await aiResultPromise;
-  const unsure = !(Number(ai.confidence) >= UNSURE);
-  // A chain or brand named in the text counts too, even if the model
-  // didn't fill in "brand" this time.
-  const named = !!ai.brand || extractBrandHints(food).length > 0;
-  if (!WEB_LOOKUP || ai.failed || (!named && !unsure) || !process.env.OPENAI_API_KEY) {
-    return ai;
-  }
-  // Web searches sometimes come back empty: one more try before settling
-  // for the estimate.
+
+/** The label online, with one more try: web searches sometimes come back
+ *  empty. Null if it couldn't be found. */
+async function labelLookup(food, grams, ml) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const web = await webLookup(food, grams, ml);
@@ -999,7 +931,17 @@ async function aiOrWebResult(food, aiResultPromise, grams, ml) {
       console.error("Web lookup failed:", err.response?.data || err.message || err);
     }
   }
-  return ai;
+  return null;
+}
+
+async function aiOrWebResult(food, aiResultPromise, grams, ml, { triedLabel = false } = {}) {
+  const ai = await aiResultPromise;
+  const unsure = !(Number(ai.confidence) >= UNSURE);
+  const named = !!ai.brand;
+  if (triedLabel || !WEB_LOOKUP || ai.failed || (!named && !unsure) || !process.env.OPENAI_API_KEY) {
+    return ai;
+  }
+  return (await labelLookup(food, grams, ml)) ?? ai;
 }
 
 // -------------------- AI: choose best DB candidate among top-N --------------------
@@ -1021,7 +963,11 @@ async function pickBestCandidateIndex(query, candidates) {
       {
         role: "system",
         content:
-          'Pick the single best matching candidate index for the query.\nReturn ONLY JSON: {"index": number, "confidence": number}\nDo NOT pick unrelated foods.\nPrefer exact brand/name matches.\nIf the query names a brand and no candidate is that brand, return {"index": -1, "confidence": 0}.\nIf the query names a brand but not a flavour, any flavour of that brand is a good match.\n',
+          'Pick the single best matching candidate index for the query.\nReturn ONLY JSON: {"index": number, "confidence": number}\nDo NOT pick unrelated foods.\nPrefer exact brand/name matches.\nIf the query names a brand and no candidate is that brand, return {"index": -1, "confidence": 0}.\nIf the query names a brand but not a flavour, any flavour of that brand is a good match.\n' +
+            "The candidate must be the same food in the same form as the query: not a dry mix, powder, " +
+            "capsule, concentrate or raw ingredient when the query is the made-up dish or drink (or the " +
+            "other way round), and not a different dish that shares a word. If none is, return " +
+            '{"index": -1, "confidence": 0}.\n',
       },
       {
         role: "user",
@@ -1093,7 +1039,6 @@ async function tryUpgradeFromDb({
   count,
   unit,
   debug,
-  brandHints,
   phaseLabel,
 }) {
   const candidates = await fatSecretSearch(query);
@@ -1133,54 +1078,24 @@ async function tryUpgradeFromDb({
   const chosenScore = tokenScore(query, chosen);
   const chosenText = `${chosen.brand || ""} ${chosen.name || ""} ${chosen.description || ""}`;
 
-  // Phrase gate (minimal)
-  const phraseMustHave = [];
-  const qNorm = normText(originalFood);
-  if (qNorm.includes("sausage roll")) phraseMustHave.push("sausage", "roll");
-  if (qNorm.includes("chicken tikka masala")) phraseMustHave.push("chicken", "tikka", "masala");
-  if (qNorm.includes("ready salted")) phraseMustHave.push("ready", "salted");
-
-  if (phraseMustHave.length && !containsAllKeywords(chosenText, phraseMustHave)) {
-    return {
-      upgraded: false,
-      out: null,
-      reason: "phrase_gate_failed",
-      meta: {
-        phraseMustHave,
-        chosen: { name: chosen.name, brand: chosen.brand },
-        chosenScore,
-      },
-    };
-  }
-
-  // Brand gate. The cleaned retry searches without the brand words, but
-  // the answer still has to be that brand: "Alpro protein yoghurt" mustn't
-  // become some other brand's (dairy) protein yoghurt. No match → the label
-  // lookup online, which is good at brands.
-  {
-    if (brandHints.length && !containsAllKeywords(chosenText, brandHints)) {
-      return {
-        upgraded: false,
-        out: null,
-        reason: "brand_gate_failed",
-        meta: { brandHints, chosen: { name: chosen.name, brand: chosen.brand }, chosenScore },
-      };
-    }
-  }
-
-  // Coffee-shop intent veto
-  if (hasCoffeeShopIntent(originalFood) && isCapsuleOrInstantDrinkCandidate(chosenText)) {
-    return {
-      upgraded: false,
-      out: null,
-      reason: "coffee_shop_format_veto",
-      meta: { chosen: { name: chosen.name, brand: chosen.brand } },
-    };
-  }
-
-  // Confidence gate. The AI estimate has been running alongside the
-  // database search and pick; only now do we need to wait for it.
+  // The AI estimate has been running alongside the database search and
+  // pick; only now do we need to wait for it.
   const aiResult = await aiResultPromise;
+
+  // Brand gate: a food with a brand has to be that brand's entry, never
+  // the closest-sounding other brand. The brand comes from the AI, so it
+  // works for any brand.
+  const brand = brandWords(aiResult?.failed ? null : aiResult?.brand);
+  if (brand.length && !containsAllKeywords(chosenText, brand)) {
+    return {
+      upgraded: false,
+      out: null,
+      reason: "brand_gate_failed",
+      meta: { brand: aiResult.brand, chosen: { name: chosen.name, brand: chosen.brand }, chosenScore },
+    };
+  }
+
+  // Confidence gate.
   const aiIsLow = (aiResult?.confidence ?? 0) < MIN_AI_CONFIDENCE;
   const dbPickIsWeak = pick.confidence < MIN_DB_AI_PICK_CONF;
   if (dbPickIsWeak && !aiIsLow) {
@@ -1327,10 +1242,6 @@ async function resolveFood(food, { debug = false } = {}) {
   const counted = await resolveCounted(food, { debug });
   if (counted) return counted;
 
-  // An everyday UK food with label values on file: no guessing needed.
-  const staple = resolveStaple(food);
-  if (staple) return staple;
-
   const aiResultPromise = estimateAI(food).catch((err) => {
     console.error("AI estimate failed:", err.response?.data || err.message || err);
     return aiFailure(food);
@@ -1341,15 +1252,32 @@ async function resolveFood(food, { debug = false } = {}) {
   const amount = !grams && !ml ? extractCountAndUnit(food) : null;
   const count = amount?.count ?? null;
   const unit = amount?.unit ?? null;
-  const brandHints = extractBrandHints(food);
-  const common = { originalFood: food, aiResultPromise, grams, ml, count, unit, debug, brandHints };
+  const common = { originalFood: food, aiResultPromise, grams, ml, count, unit, debug };
+
+  // The database search starts now, alongside the AI estimate.
+  const primaryPromise = tryUpgradeFromDb({ ...common, query: food, phaseLabel: "primary" })
+    .catch((error) => ({ upgraded: false, error }));
+
+  // A branded product (any brand: the AI spots it): its own label first.
+  // The database's entries are mostly US products and the AI has to guess
+  // sizes, so the brand's label is the most accurate source there is.
+  const ai = await aiResultPromise;
+  const brand = ai.failed ? null : cleanBrand(ai.brand);
+  let triedLabel = false;
+  if (brand && WEB_LOOKUP && process.env.OPENAI_API_KEY) {
+    triedLabel = true;
+    const label = await labelLookup(food, grams, ml);
+    if (label) return debug ? { ...label, debug: { used: "label", brand } } : label;
+  }
+  const fallback = () => aiOrWebResult(food, aiResultPromise, grams, ml, { triedLabel });
 
   try {
-    const primary = await tryUpgradeFromDb({ ...common, query: food, phaseLabel: "primary" });
+    const primary = await primaryPromise;
+    if (primary.error) throw primary.error;
     if (primary.upgraded) return primary.out;
 
     // ONE cleaned retry (hard-capped)
-    const cleaned = cleanQueryForFatSecret(food, brandHints);
+    const cleaned = cleanQueryForFatSecret(food, brandWords(brand));
     if (cleaned && cleaned !== normText(food)) {
       const cleanedRetry = await tryUpgradeFromDb({
         ...common,
@@ -1358,7 +1286,7 @@ async function resolveFood(food, { debug = false } = {}) {
       });
       if (cleanedRetry.upgraded) return cleanedRetry.out;
 
-      const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
+      const aiResult = await fallback();
       return debug
         ? {
             ...aiResult,
@@ -1372,89 +1300,17 @@ async function resolveFood(food, { debug = false } = {}) {
         : aiResult;
     }
 
-    const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
+    const aiResult = await fallback();
     return debug
       ? { ...aiResult, debug: { used: "ai_only", reason: primary.reason, meta: primary.meta } }
       : aiResult;
   } catch (err) {
     console.error("FatSecret resolve error:", err.response?.data || err.message || err);
-    const aiResult = await aiOrWebResult(food, aiResultPromise, grams, ml);
+    const aiResult = await fallback();
     return debug
       ? { ...aiResult, debug: { used: "ai_only", reason: "db_exception", error: err.message } }
       : aiResult;
   }
-}
-
-// -------------------- UK staples (label values) --------------------
-const STAPLE_INDEX = STAPLES.map((st) => ({
-  st,
-  keys: st.names.map((n) => foodWords(n).sort().join(" ")),
-}));
-
-/** The staple a food is, if its food words (not amounts) match exactly. */
-function findStaple(food) {
-  const key = foodWords(food).sort().join(" ");
-  if (!key) return null;
-  return STAPLE_INDEX.find((x) => x.keys.includes(key))?.st ?? null;
-}
-
-/** "250ml unsweetened soya milk", "1 slice of white bread", "a large egg". */
-function resolveStaple(food) {
-  const st = findStaple(food);
-  if (!st) return null;
-  const text = String(food).toLowerCase();
-  const grams = extractExplicitGrams(food);
-  const ml = extractExplicitMl(food);
-  const amount = !grams && !ml ? extractCountAndUnit(food) : null;
-
-  let size = null;
-  for (const s of Object.keys(st.sizes || {})) {
-    if (new RegExp(`\\b${s}\\b`).test(text)) size = s;
-  }
-  const itemWeight = size ? st.sizes[size] : st.item;
-
-  let qty; // grams, or ml for drinks
-  let portion;
-  if (st.drink) {
-    if (ml) {
-      qty = ml;
-    } else if (amount?.unit && DRINK_UNITS[amount.unit]) {
-      qty = amount.count * DRINK_UNITS[amount.unit];
-    } else if (grams) {
-      qty = grams;
-    } else if (!amount || !amount.unit) {
-      qty = st.serving * (amount?.count ?? 1);
-    } else {
-      return null; // "2 tbsp of milk" etc.: leave it to the usual lookup
-    }
-    portion = `${Math.round(qty)}ml`;
-  } else if (grams) {
-    qty = grams;
-    portion = `${Math.round(grams)}g`;
-  } else if (itemWeight && (!amount || !amount.unit || ["slice", "piece", "serving"].includes(amount.unit))) {
-    const n = amount?.count ?? 1;
-    qty = n * itemWeight;
-    const what = `${size ? `${size} ` : ""}${st.itemLabel || "item"}`;
-    portion = `${n === 1 ? "" : `${n} × `}${what} (${Math.round(itemWeight)}g)`;
-  } else {
-    return null;
-  }
-
-  const f = qty / 100;
-  return {
-    source: "label",
-    mode: st.drink ? "volume" : "weight",
-    name: st.label,
-    grams: st.drink ? null : Math.round(qty),
-    ml: st.drink ? Math.round(qty) : null,
-    serving_description: portion,
-    calories: Math.round(st.per100.kcal * f),
-    protein: round1(st.per100.protein * f),
-    carbs: round1(st.per100.carbs * f),
-    fat: round1(st.per100.fat * f),
-    confidence: 0.98,
-    basis: `${st.per100.kcal} kcal/100${st.drink ? "ml" : "g"} × ${Math.round(qty)}${st.drink ? "ml" : "g"} (UK label)`,
-  };
 }
 
 // -------------------- Counted foods --------------------
@@ -1605,7 +1461,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 12;
+const RESOLVE_VERSION = 14;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
