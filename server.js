@@ -923,6 +923,26 @@ async function webLookup(food, grams, ml) {
   // "70g of X": scale from per-100g when the label gives it.
   const per100 = Number(j.calories_per_100g);
   if (grams && per100 > 0) {
+    // The per-serving and per-100g figures should agree. When they don't
+    // (the pot's values put in the per-100g boxes, say), the serving
+    // figures are the ones read straight off the label: use those.
+    const servingGrams = toPositiveNumberOrNull(j.serving_grams);
+    const fromServing = servingGrams ? (Number(j.calories) / servingGrams) * 100 : null;
+    if (fromServing && Math.abs(per100 - fromServing) > fromServing * 0.25) {
+      const f = grams / servingGrams;
+      return {
+        source: "web",
+        mode: "weight",
+        name: j.name || food,
+        grams,
+        ml: null,
+        calories: Math.round(Number(j.calories) * f),
+        protein: round1((Number(j.protein) || 0) * f),
+        carbs: round1((Number(j.carbs) || 0) * f),
+        fat: round1((Number(j.fat) || 0) * f),
+        confidence: 0.85,
+      };
+    }
     const f = grams / 100;
     return {
       source: "web",
@@ -1133,8 +1153,11 @@ async function tryUpgradeFromDb({
     };
   }
 
-  // Brand gate only for primary
-  if (phaseLabel === "primary") {
+  // Brand gate. The cleaned retry searches without the brand words, but
+  // the answer still has to be that brand: "Alpro protein yoghurt" mustn't
+  // become some other brand's (dairy) protein yoghurt. No match → the label
+  // lookup online, which is good at brands.
+  {
     if (brandHints.length && !containsAllKeywords(chosenText, brandHints)) {
       return {
         upgraded: false,
@@ -1582,7 +1605,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 11;
+const RESOLVE_VERSION = 12;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
