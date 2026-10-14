@@ -1300,16 +1300,15 @@ const off = createOffSearch({
 /**
  * A branded food from Open Food Facts: the product the AI picks among the
  * UK products found (it has to be that brand), its label values per 100g
- * times the amount. The amount is the weight or volume typed; with no
- * amount, one serving as the pack gives it. [aiWeight]: otherwise use the
- * AI's weight for what was described ("2 slices"). Null if there's no
- * clear match or no reliable amount.
+ * times the amount. The amount is the weight or volume typed, or with
+ * [aiWeight] the AI's weight for what was described ("2 slices"). Not its
+ * listed serving: Open Food Facts often gives 100g there when the pack
+ * doesn't say ("Tesco porridge oats" came out as a 100g bowl). Null if
+ * there's no clear match or no reliable amount.
  */
 async function offLookup(food, { brand, ai, grams, ml, aiWeight }) {
   // Two passes share one search (it's remembered), so this costs one.
-  const parsed = parseFood(food);
-  const amountKnown = !!(grams || ml || parsed?.amount.kind === "none");
-  if (!aiWeight && !amountKnown) return null;
+  if (!aiWeight && !grams && !ml) return null;
   const terms = cleanQueryForFatSecret(food, []);
   const products = await off.search(terms);
   if (!products?.length) return null;
@@ -1335,16 +1334,12 @@ async function offLookup(food, { brand, ai, grams, ml, aiWeight }) {
 
   let qty = null; // grams, or ml for a drink
   let volume = false;
-  let serving = null;
   if (ml) {
     if (!p.liquid) return null; // per 100g can't be poured into ml
     qty = ml;
     volume = true;
   } else if (grams) {
     qty = grams;
-  } else if (parsed?.amount.kind === "none" && p.servingGrams) {
-    qty = p.servingGrams;
-    serving = p.servingLabel;
   } else if (aiWeight) {
     const w = toPositiveNumberOrNull(p.liquid ? ai?.ml : ai?.grams);
     if (!w || ai?.failed) return null;
@@ -1357,11 +1352,10 @@ async function offLookup(food, { brand, ai, grams, ml, aiWeight }) {
   const unit = volume ? "ml" : "g";
   return {
     source: "label",
-    mode: serving ? "serving" : volume ? "volume" : "weight",
+    mode: volume ? "volume" : "weight",
     name: p.brand && !p.name.toLowerCase().includes(p.brand.toLowerCase()) ? `${p.brand} ${p.name}` : p.name,
     grams: volume ? null : Math.round(qty),
     ml: volume ? Math.round(qty) : null,
-    ...(serving ? { serving_description: serving } : {}),
     calories: Math.round(p.per100.calories * f),
     protein: round1(p.per100.protein * f),
     carbs: round1(p.per100.carbs * f),
@@ -1453,8 +1447,8 @@ async function resolveFood(food, { debug = false } = {}) {
   // A branded product (any brand: the AI spots it): its own label first.
   // The database's entries are mostly US products and the AI has to guess
   // sizes, so the brand's label is the most accurate source there is:
-  // 1. Open Food Facts when we know how much (a weight, a volume, or one
-  //    serving as sold): the label's numbers, plain arithmetic;
+  // 1. Open Food Facts when a weight or volume is given: the label's
+  //    numbers, plain arithmetic;
   // 2. the label online (it can count: "3 hash browns" off the pack);
   // 3. Open Food Facts with the AI's weight for the amount.
   const ai = await aiResultPromise;
@@ -1559,7 +1553,9 @@ function cachedResolve(food) {
 async function resolveCounted(food, { debug = false } = {}) {
   const c = countedFood(food);
   if (!c) return null;
-  const one = await cachedResolve(c.single);
+  // The admin Food check (debug) looks the single one up fresh too, so it
+  // tests the lookup as it is now rather than an answer saved earlier.
+  const one = debug ? await lookupFood(c.single, { debug: true }) : await cachedResolve(c.single);
   if (one.failed || !(Number(one.calories) > 0)) return null;
   const n = c.count;
   const each = one.serving_description || (one.grams ? `${one.grams}g` : one.ml ? `${one.ml}ml` : "1");
@@ -1657,7 +1653,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 14;
+const RESOLVE_VERSION = 15;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
