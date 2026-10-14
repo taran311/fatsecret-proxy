@@ -1,7 +1,7 @@
-// Open Food Facts: a free, open database of packaged foods with each
-// product's label values, with strong UK coverage. Used for branded foods,
-// where our FatSecret plan (US products) and the AI (guessing sizes) are
-// weakest.
+// Open Food Facts: a free, open database of packaged foods from around the
+// world with each product's label values, searched in the person's
+// country. Used for branded foods, where our FatSecret plan (US products)
+// and the AI (guessing sizes) are weakest.
 //
 // Their search allows 10 requests a minute from one server, so we keep
 // well under that and remember every search: when the minute's allowance
@@ -57,6 +57,24 @@ export function offProduct(p) {
   };
 }
 
+const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+
+/** Open Food Facts' name for a country: "GB" → "united-kingdom". */
+export function countryTag(cc) {
+  let name;
+  try {
+    name = regionNames.of(String(cc || "GB").toUpperCase());
+  } catch {
+    name = null;
+  }
+  return String(name || "United Kingdom")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
 /** How a product reads to the AI that picks between them. */
 export function offDescription(prod) {
   const p = prod.per100;
@@ -76,10 +94,11 @@ export function offDescription(prod) {
 export function createOffSearch({ get, cache, perMinute = 8, userAgent, now = () => Date.now() }) {
   const recent = []; // times of searches in the last minute
 
-  async function search(terms) {
+  async function search(terms, country = "GB") {
     const q = String(terms || "").trim().toLowerCase();
     if (q.length < 3) return [];
-    const key = `off:${q}`;
+    const tag = countryTag(country);
+    const key = `off:${tag}:${q}`;
     const cached = cache?.get(key);
     if (cached) return cached;
 
@@ -97,10 +116,10 @@ export function createOffSearch({ get, cache, perMinute = 8, userAgent, now = ()
           json: 1,
           page_size: 12,
           fields: FIELDS,
-          // Products sold in the UK.
+          // Products sold in the person's country.
           tagtype_0: "countries",
           tag_contains_0: "contains",
-          tag_0: "united-kingdom",
+          tag_0: tag,
         },
         headers: { "User-Agent": userAgent },
         timeout: 8000,

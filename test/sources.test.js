@@ -1,7 +1,7 @@
 // Run with: npm test
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { offProduct, createOffSearch } from "../off.js";
+import { offProduct, createOffSearch, countryTag } from "../off.js";
 import { createCofid, words } from "../cofid.js";
 
 // Stands in for NodeCache.
@@ -81,4 +81,10 @@ test("UK food tables: cooking words and words written as one", () => {
     "chickpeas finds chick peas; cooked alone doesn't find asparagus");
   assert.equal(tables.search("150g cooked white rice")[0].name,
     "Rice, white, long grain, boiled in unsalted water");
+});
+
+test("Open Food Facts searches the person's country", () => {
+  assert.equal(countryTag("GB"), "united-kingdom");
+  assert.equal(countryTag("US"), "united-states");
+  assert.equal(countryTag("fr"), "france");
 });
