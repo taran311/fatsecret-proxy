@@ -1284,7 +1284,9 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
   // Only keep real answers. A failed lookup returns an error so the app
   // can offer a retry, rather than silently logging 0 kcal (and
   // remembering that 0).
-  const out = await lookupFood(food, { debug: !!debug, country });
+  // "Look up again" in the app: someone thinks the saved answer is wrong.
+  const refresh = req.body?.refresh === true;
+  const out = await lookupFood(food, { debug: !!debug, country, refresh });
   if (out.failed && !debug) {
     return res.status(502).json({ error: "Couldn't look that up, try again" });
   }
@@ -1300,11 +1302,19 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
  *    when its numbers add up.
  * [debug] skips 1 and 2 and saves nothing (the admin Food check).
  */
-async function lookupFood(food, { debug = false, country = DEFAULT_COUNTRY } = {}) {
+async function lookupFood(food, { debug = false, country = DEFAULT_COUNTRY, refresh = false } = {}) {
   // Saved per country: the same words can mean a different product or size.
   const key = savedKey(country, food);
   const cacheKey = `resolve:v${RESOLVE_VERSION}:${key}`;
-  if (!debug) {
+  if (refresh && !debug) {
+    // Throw the saved answers away (this text, and this food in any
+    // amount), so a wrong one can't come back, then look it up fresh.
+    await forgetFood(food, country).catch(() => {});
+    const c = countedFood(food);
+    if (c) await forgetFood(c.single, country).catch(() => {});
+    countEvent("food_lookup_refresh");
+  }
+  if (!debug && !refresh) {
     const cached = cache.get(cacheKey) || (await readSavedLookup(key));
     if (cached) {
       cache.set(cacheKey, cached, RESOLVE_TTL_SECONDS);
