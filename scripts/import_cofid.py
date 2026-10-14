@@ -68,6 +68,12 @@ def main(path):
         name = str(row[col["name"]] or "").strip()
         if not name:
             continue
+        # "…, weighed with skin/stone/core": values per 100g including the
+        # parts not eaten. Our amounts are always of what's eaten, so these
+        # would undercount; the "flesh only" entries cover the same foods.
+        if "weighed with" in name.lower():
+            skipped += 1
+            continue
         per100 = {
             "calories": number(row[col["kcal"]]),
             "protein": number(row[col["protein"]]),
@@ -98,7 +104,7 @@ def main(path):
                   "Open Government Licence v3.0. Made by scripts/import_cofid.py.",
         "foods": foods,
     }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    print(f"{len(foods)} foods written to {out} ({skipped} skipped: values not known)")
+    print(f"{len(foods)} foods written to {out} ({skipped} skipped: values not known, or weighed with parts not eaten)")
 
 
 if __name__ == "__main__":

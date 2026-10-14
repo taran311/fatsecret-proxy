@@ -1005,7 +1005,9 @@ async function pickBestCandidateIndex(query, candidates) {
           'Pick the single best matching candidate index for the query.\nReturn ONLY JSON: {"index": number, "confidence": number}\nDo NOT pick unrelated foods.\nPrefer exact brand/name matches.\nIf the query names a brand and no candidate is that brand, return {"index": -1, "confidence": 0}.\nIf the query names a brand but not a flavour, any flavour of that brand is a good match.\n' +
             "The candidate must be the same food in the same form as the query: not a dry mix, powder, " +
             "capsule, concentrate or raw ingredient when the query is the made-up dish or drink (or the " +
-            "other way round), and not a different dish that shares a word. If none is, return " +
+            "other way round), and not a different dish that shares a word. A candidate that contradicts a " +
+            "detail in the query (sweetened vs unsweetened, raw vs cooked, with vs without skin, light vs " +
+            "full fat) is not a match either. If none is, return " +
             '{"index": -1, "confidence": 0}.\n',
       },
       {
@@ -1377,7 +1379,7 @@ console.log(`UK food tables: ${COFID.size} foods`);
  */
 async function cofidLookup(food, { ai, grams, ml }) {
   if (!COFID.size) return null;
-  const candidates = COFID.search(food, 8);
+  const candidates = COFID.search(food, 10);
   if (!candidates.length) return null;
   let pick;
   try {

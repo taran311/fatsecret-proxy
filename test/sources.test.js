@@ -69,3 +69,16 @@ test("UK food tables: found by words (the AI then picks)", () => {
   assert.deepEqual(tables.search("tofu"), []);
   assert.deepEqual(words("2 slices of white bread"), ["white", "bread"]);
 });
+
+test("UK food tables: cooking words and words written as one", () => {
+  const tables = createCofid([
+    { name: "Beans, chick peas, whole, dried, boiled in unsalted water", per100: { calories: 121, protein: 8.4, carbs: 18.2, fat: 2.1 } },
+    { name: "Asparagus, steamed", per100: { calories: 26, protein: 3.4, carbs: 1.4, fat: 0.8 } },
+    { name: "Rice, white, long grain, boiled in unsalted water", per100: { calories: 131, protein: 2.8, carbs: 31.1, fat: 0.4 } },
+  ]);
+  assert.deepEqual(tables.search("100g cooked chickpeas").map((f) => f.name),
+    ["Beans, chick peas, whole, dried, boiled in unsalted water"],
+    "chickpeas finds chick peas; cooked alone doesn't find asparagus");
+  assert.equal(tables.search("150g cooked white rice")[0].name,
+    "Rice, white, long grain, boiled in unsalted water");
+});

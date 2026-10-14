@@ -36,6 +36,12 @@ const SKIP = new Set([
   "small", "medium", "large", "half", "one", "two", "three", "some",
 ]);
 
+// "Cooked" in what people type, and the ways the tables say it was cooked.
+const COOKED = new Set([
+  "cooked", "boiled", "steamed", "poached", "stewed", "microwaved", "baked",
+  "roasted", "grilled", "fried", "simmered", "braised",
+]);
+
 export function words(s) {
   return [...new Set(
     normText(s)
@@ -62,22 +68,36 @@ export function loadCofid(path) {
 export function createCofid(list) {
   const foods = list
     .filter((f) => f && f.name && f.per100)
-    .map((f) => ({ ...f, words: new Set(words(f.name)) }));
+    .map((f) => {
+      const w = words(f.name);
+      // Two words written as one too: "Chick peas" is also "chickpea".
+      const joined = w.slice(1).map((x, i) => w[i] + x);
+      return { ...f, words: new Set([...w, ...joined]) };
+    });
 
   /**
    * Up to [limit] entries sharing the most words with [query]: at least
    * half of the query's food words have to be in the entry's name.
    * Shorter names first on a tie. The AI then picks between them.
    */
-  function search(query, limit = 8) {
+  function search(query, limit = 10) {
     const q = words(query);
     if (!q.length) return [];
     const scored = [];
     for (const f of foods) {
       let hit = 0;
-      for (const w of q) if (f.words.has(w)) hit++;
+      let foodHit = 0; // words naming the food, not how it was cooked
+      for (const w of q) {
+        if (f.words.has(w)) {
+          hit++;
+          if (!COOKED.has(w)) foodHit++;
+        } else if (w === "cooked" && [...f.words].some((x) => COOKED.has(x))) {
+          // "cooked rice" matches "Rice, …, boiled in unsalted water".
+          hit++;
+        }
+      }
       const score = hit / q.length;
-      if (score >= 0.5) scored.push({ f, score });
+      if (foodHit > 0 && score >= 0.5) scored.push({ f, score });
     }
     scored.sort((a, b) => b.score - a.score || a.f.words.size - b.f.words.size);
     return scored.slice(0, limit).map((x) => x.f);
