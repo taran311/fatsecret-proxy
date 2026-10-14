@@ -1318,7 +1318,8 @@ async function lookupFood(food, { debug = false, country = DEFAULT_COUNTRY } = {
     }
   }
   const out = await resolveFood(food, { debug, country });
-  if (!debug && !out.failed && plausible(out)) {
+  // An answer marked for checking isn't saved for anyone else.
+  if (!debug && !out.failed && !out.check && plausible(out)) {
     cache.set(cacheKey, out, RESOLVE_TTL_SECONDS);
     saveLookup(key, food, out);
     learnFoodBase(food, out, country);
@@ -1456,6 +1457,26 @@ async function cofidLookup(food, { ai, grams, ml, country }) {
 }
 
 /**
+ * A label answer that's far from what the AI expects for the same words
+ * (under half or over double) is probably a different product from the
+ * one meant: "linda mccartney sausages" read off a pack of mini sausages,
+ * say. It's still shown, but marked "Check this" with the product it
+ * matched, and never saved for anyone else.
+ */
+function crossCheck(result, ai) {
+  const expected = Number(ai?.calories);
+  const got = Number(result?.calories);
+  if (ai?.failed || !(expected > 0) || !(got > 0)) return result;
+  const ratio = got / expected;
+  if (ratio >= 0.5 && ratio <= 2) return result;
+  return {
+    ...result,
+    confidence: Math.min(Number(result.confidence) || 0.5, 0.5),
+    check: `Matched "${result.name}": ${Math.round(got)} kcal, where a typical one is about ${Math.round(expected)}`,
+  };
+}
+
+/**
  * The hybrid lookup for one food: the AI estimate and the database
  * search + pick run at the same time, so it takes about as long as the
  * slower of the two, not both added up.
@@ -1495,13 +1516,18 @@ async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = 
   let triedLabel = false;
   if (brand) {
     const off = await offLookup(food, { brand, ai, grams, ml, aiWeight: false, country });
-    if (off) return debug ? { ...off, debug: { used: "open_food_facts", brand } } : off;
+    if (off) {
+      const checked = crossCheck(off, ai);
+      return debug ? { ...checked, debug: { used: "open_food_facts", brand } } : checked;
+    }
     if (WEB_LOOKUP && process.env.OPENAI_API_KEY) {
       triedLabel = true;
-      const label = await labelLookup(food, grams, ml, country);
+      const found = await labelLookup(food, grams, ml, country);
+      const label = found && crossCheck(found, ai);
       if (label) return debug ? { ...label, debug: { used: "label", brand } } : label;
     }
-    const offGuess = await offLookup(food, { brand, ai, grams, ml, aiWeight: true, country });
+    const guessed = await offLookup(food, { brand, ai, grams, ml, aiWeight: true, country });
+    const offGuess = guessed && crossCheck(guessed, ai);
     if (offGuess) {
       return debug ? { ...offGuess, debug: { used: "open_food_facts_ai_weight", brand } } : offGuess;
     }
@@ -1677,6 +1703,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
       why: [
         r.debug?.reason || r.debug?.via,
         r.basis && `worked out: ${r.basis}`,
+        r.check && `CHECK: ${r.check}`,
         r.debug?.primary?.reason && `first try: ${r.debug.primary.reason}`,
         r.debug?.error,
       ]
