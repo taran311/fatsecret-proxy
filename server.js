@@ -844,12 +844,18 @@ async function webLookup(food, grams, ml) {
           '{"found": boolean, "name": string, "serving_description": string, "serving_grams": number|null, ' +
           '"serving_ml": number|null, "calories": number, "protein": number, "carbs": number, "fat": number, ' +
           '"calories_per_100g": number|null, "protein_per_100g": number|null, "carbs_per_100g": number|null, ' +
-          '"fat_per_100g": number|null}\n' +
+          '"fat_per_100g": number|null, "label_serving": {"description": string, "items": number|null, ' +
+          '"item": string|null, "grams": number|null, "calories": number, "protein": number, "carbs": number, ' +
+          '"fat": number}|null}\n' +
           "calories/protein/carbs/fat are for EXACTLY the amount described: \"4 Jaffa Cakes\" is four cakes, " +
           "\"2 Nakd bars\" is two bars. Labels often give a serving of several items, so work out the " +
           "amount asked for from the per-item or per-100g values. If no amount is given, use one serving " +
           "as sold (one bar, one pack, one bottle). serving_description says what the numbers are for, " +
           "e.g. \"3 biscuits (33g)\". " +
+          "label_serving is the serving exactly as printed on the label, numbers copied not worked out: " +
+          "its description (\"3 hash browns (118g)\"), items = how many separate pieces that serving is " +
+          "(3 for 3 hash browns, 2 for \"2 biscuits\", 1 for one bar; null if it isn't pieces, like 30g of " +
+          "cereal), item = one piece's name in the singular (\"hash brown\"), and its grams and values. " +
           'If you can\'t find this product\'s label, reply {"found": false}.',
       },
       { role: "user", content: food },
@@ -897,6 +903,36 @@ async function webLookup(food, grams, ml) {
       carbs: round1((Number(j.carbs_per_100g) || 0) * f),
       fat: round1((Number(j.fat_per_100g) || 0) * f),
       confidence: 0.85,
+    };
+  }
+
+  // A number of pieces ("3 hash browns", "1 Weetabix"): worked out here
+  // from the label's own serving and how many pieces it is, rather than
+  // trusting the model's arithmetic (it would sometimes give a 2-biscuit
+  // serving as one biscuit).
+  const amount = ml ? null : extractCountAndUnit(food);
+  const ls = j.label_serving;
+  const items = toPositiveNumberOrNull(ls?.items);
+  const lsKcal = Number(ls?.calories);
+  if (amount && (!amount.unit || ITEM_UNITS.has(amount.unit)) && items && lsKcal > 0 &&
+      plausible({ calories: lsKcal, protein: ls.protein, carbs: ls.carbs, fat: ls.fat, grams: ls.grams })) {
+    const f = amount.count / items;
+    const each = toPositiveNumberOrNull(ls.grams) ? Number(ls.grams) / items : null;
+    const piece = String(ls.item || "").trim() || "piece";
+    const label = `${fmtAmount(amount.count)} ${piece}${each ? ` (${Math.round(each)}g)` : ""}`;
+    return {
+      source: "web",
+      mode: "serving",
+      name: j.name || food,
+      grams: each ? Math.round(each * amount.count) : null,
+      ml: null,
+      serving_description: label,
+      calories: Math.round(lsKcal * f),
+      protein: round1((Number(ls.protein) || 0) * f),
+      carbs: round1((Number(ls.carbs) || 0) * f),
+      fat: round1((Number(ls.fat) || 0) * f),
+      confidence: 0.85,
+      basis: `label: ${Math.round(lsKcal)} kcal per ${ls.description || `${items} pieces`} × ${fmtAmount(amount.count)}/${fmtAmount(items)}`,
     };
   }
 
