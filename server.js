@@ -24,6 +24,9 @@ import { registerChat } from "./chat.js";
 import { registerGifts, isAdmin } from "./gifts.js";
 import { registerAnalytics, countEvent } from "./analytics.js";
 import { readFileSync } from "node:fs";
+import { parseFood, plausible, learn, serve } from "./food_base.js";
+import { createOffSearch, offDescription } from "./off.js";
+import { loadCofid, cofidDescription } from "./cofid.js";
 
 dotenv.config();
 
@@ -1205,30 +1208,183 @@ app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken
     return res.status(400).json({ error: "Describe one food at a time" });
   }
 
+  if (!debug) countEvent("food_lookup");
+  // Only keep real answers. A failed lookup returns an error so the app
+  // can offer a retry, rather than silently logging 0 kcal (and
+  // remembering that 0).
+  const out = await lookupFood(food, { debug: !!debug });
+  if (out.failed && !debug) {
+    return res.status(502).json({ error: "Couldn't look that up, try again" });
+  }
+  return res.json(out);
+});
+
+/**
+ * One food, the quickest way there is:
+ * 1. the same words asked before (memory, then saved), as they were;
+ * 2. the same food in another amount, worked out from its saved record
+ *    ("tofu 350g" from "200g tofu");
+ * 3. otherwise the full lookup, whose answer is saved for both, but only
+ *    when its numbers add up.
+ * [debug] skips 1 and 2 and saves nothing (the admin Food check).
+ */
+async function lookupFood(food, { debug = false } = {}) {
   const key = normalizeFood(food);
   const cacheKey = `resolve:v${RESOLVE_VERSION}:${key}`;
-  if (!debug) countEvent("food_lookup");
   if (!debug) {
     const cached = cache.get(cacheKey) || (await readSavedLookup(key));
     if (cached) {
       cache.set(cacheKey, cached, RESOLVE_TTL_SECONDS);
-      return res.json(cached);
+      countEvent("food_lookup_saved");
+      return cached;
+    }
+    const fromSaved = await fromFoodBase(food);
+    if (fromSaved) {
+      countEvent("food_lookup_saved");
+      return fromSaved;
     }
   }
-
-  // Only keep real answers. A failed lookup returns an error so the app
-  // can offer a retry, rather than silently logging 0 kcal (and
-  // remembering that 0).
   const out = await resolveFood(food, { debug });
-  if (out.failed && !debug) {
-    return res.status(502).json({ error: "Couldn't look that up, try again" });
-  }
-  if (!debug) {
+  if (!debug && !out.failed && plausible(out)) {
     cache.set(cacheKey, out, RESOLVE_TTL_SECONDS);
     saveLookup(key, food, out);
+    learnFoodBase(food, out);
   }
-  return res.json(out);
+  return out;
+}
+
+// -------------------- Open Food Facts (branded foods) --------------------
+const off = createOffSearch({
+  get: (url, opts) => axios.get(url, opts),
+  cache,
+  perMinute: Number(process.env.OFF_SEARCHES_PER_MIN) || 8,
+  userAgent: process.env.OFF_USER_AGENT || "TheCalorieCard/1.0 (thecaloriecard.com)",
 });
+
+/**
+ * A branded food from Open Food Facts: the product the AI picks among the
+ * UK products found (it has to be that brand), its label values per 100g
+ * times the amount. The amount is the weight or volume typed; with no
+ * amount, one serving as the pack gives it. [aiWeight]: otherwise use the
+ * AI's weight for what was described ("2 slices"). Null if there's no
+ * clear match or no reliable amount.
+ */
+async function offLookup(food, { brand, ai, grams, ml, aiWeight }) {
+  // Two passes share one search (it's remembered), so this costs one.
+  const parsed = parseFood(food);
+  const amountKnown = !!(grams || ml || parsed?.amount.kind === "none");
+  if (!aiWeight && !amountKnown) return null;
+  const terms = cleanQueryForFatSecret(food, []);
+  const products = await off.search(terms);
+  if (!products?.length) return null;
+
+  const words = brandWords(brand);
+  const candidates = products
+    .filter((p) => containsAllKeywords(`${p.brand} ${p.name}`, words))
+    .slice(0, 6);
+  if (!candidates.length) return null;
+  let pick;
+  try {
+    pick = await pickBestCandidateIndex(
+      food,
+      candidates.map((p) => ({ name: p.name, brand: p.brand, description: offDescription(p) }))
+    );
+  } catch {
+    return null;
+  }
+  if (!(pick.index >= 0 && pick.index < candidates.length) || pick.confidence < MIN_DB_AI_PICK_CONF) {
+    return null;
+  }
+  const p = candidates[pick.index];
+
+  let qty = null; // grams, or ml for a drink
+  let volume = false;
+  let serving = null;
+  if (ml) {
+    if (!p.liquid) return null; // per 100g can't be poured into ml
+    qty = ml;
+    volume = true;
+  } else if (grams) {
+    qty = grams;
+  } else if (parsed?.amount.kind === "none" && p.servingGrams) {
+    qty = p.servingGrams;
+    serving = p.servingLabel;
+  } else if (aiWeight) {
+    const w = toPositiveNumberOrNull(p.liquid ? ai?.ml : ai?.grams);
+    if (!w || ai?.failed) return null;
+    qty = w;
+    volume = p.liquid && !!ai?.ml;
+  }
+  if (!qty) return null;
+
+  const f = qty / 100;
+  const unit = volume ? "ml" : "g";
+  return {
+    source: "label",
+    mode: serving ? "serving" : volume ? "volume" : "weight",
+    name: p.brand && !p.name.toLowerCase().includes(p.brand.toLowerCase()) ? `${p.brand} ${p.name}` : p.name,
+    grams: volume ? null : Math.round(qty),
+    ml: volume ? Math.round(qty) : null,
+    ...(serving ? { serving_description: serving } : {}),
+    calories: Math.round(p.per100.calories * f),
+    protein: round1(p.per100.protein * f),
+    carbs: round1(p.per100.carbs * f),
+    fat: round1(p.per100.fat * f),
+    confidence: 0.9,
+    basis: `${Math.round(p.per100.calories)} kcal/100${unit} × ${Math.round(qty)}${unit} (Open Food Facts)`,
+  };
+}
+
+// -------------------- UK food tables (everyday foods) --------------------
+const COFID = loadCofid(new URL("./data/cofid.json", import.meta.url));
+console.log(`UK food tables: ${COFID.size} foods`);
+
+/**
+ * An unbranded food from the UK food tables: the entry the AI picks among
+ * those sharing its words, per 100g times the weight typed, or the AI's
+ * weight for what was described ("1 banana", "a bowl of rice"). Null if
+ * nothing in the tables is clearly that food.
+ */
+async function cofidLookup(food, { ai, grams, ml }) {
+  if (!COFID.size) return null;
+  const candidates = COFID.search(food, 8);
+  if (!candidates.length) return null;
+  let pick;
+  try {
+    pick = await pickBestCandidateIndex(
+      food,
+      candidates.map((f) => ({ name: f.name, brand: null, description: cofidDescription(f) }))
+    );
+  } catch {
+    return null;
+  }
+  if (!(pick.index >= 0 && pick.index < candidates.length) || pick.confidence < MIN_DB_AI_PICK_CONF) {
+    return null;
+  }
+  const f = candidates[pick.index];
+  // Most drinks weigh about what their volume is (1ml ≈ 1g); alcoholic
+  // drinks are given per 100ml in the tables anyway.
+  const aiAmount = ai?.failed ? null : toPositiveNumberOrNull(ai?.grams) ?? toPositiveNumberOrNull(ai?.ml);
+  const qty = grams || ml || aiAmount;
+  if (!qty) return null;
+  const volume = !!ml || (!grams && !toPositiveNumberOrNull(ai?.grams) && !!toPositiveNumberOrNull(ai?.ml));
+  const unit = volume ? "ml" : "g";
+  const fct = qty / 100;
+  return {
+    source: "tables",
+    mode: volume ? "volume" : "weight",
+    name: f.name,
+    grams: volume ? null : Math.round(qty),
+    ml: volume ? Math.round(qty) : null,
+    calories: Math.round(f.per100.calories * fct),
+    protein: round1(f.per100.protein * fct),
+    carbs: round1(f.per100.carbs * fct),
+    fat: round1(f.per100.fat * fct),
+    // The values are measured; the amount may be the AI's estimate.
+    confidence: grams || ml ? 0.92 : 0.8,
+    basis: `${Math.round(f.per100.calories)} kcal/100${unit} × ${Math.round(qty)}${unit} (UK food tables)`,
+  };
+}
 
 /**
  * The hybrid lookup for one food: the AI estimate and the database
@@ -1260,14 +1416,30 @@ async function resolveFood(food, { debug = false } = {}) {
 
   // A branded product (any brand: the AI spots it): its own label first.
   // The database's entries are mostly US products and the AI has to guess
-  // sizes, so the brand's label is the most accurate source there is.
+  // sizes, so the brand's label is the most accurate source there is:
+  // 1. Open Food Facts when we know how much (a weight, a volume, or one
+  //    serving as sold): the label's numbers, plain arithmetic;
+  // 2. the label online (it can count: "3 hash browns" off the pack);
+  // 3. Open Food Facts with the AI's weight for the amount.
   const ai = await aiResultPromise;
   const brand = ai.failed ? null : cleanBrand(ai.brand);
   let triedLabel = false;
-  if (brand && WEB_LOOKUP && process.env.OPENAI_API_KEY) {
-    triedLabel = true;
-    const label = await labelLookup(food, grams, ml);
-    if (label) return debug ? { ...label, debug: { used: "label", brand } } : label;
+  if (brand) {
+    const off = await offLookup(food, { brand, ai, grams, ml, aiWeight: false });
+    if (off) return debug ? { ...off, debug: { used: "open_food_facts", brand } } : off;
+    if (WEB_LOOKUP && process.env.OPENAI_API_KEY) {
+      triedLabel = true;
+      const label = await labelLookup(food, grams, ml);
+      if (label) return debug ? { ...label, debug: { used: "label", brand } } : label;
+    }
+    const offGuess = await offLookup(food, { brand, ai, grams, ml, aiWeight: true });
+    if (offGuess) {
+      return debug ? { ...offGuess, debug: { used: "open_food_facts_ai_weight", brand } } : offGuess;
+    }
+  } else {
+    // An everyday food with no brand: the UK government food tables.
+    const uk = await cofidLookup(food, { ai, grams, ml });
+    if (uk) return debug ? { ...uk, debug: { used: "uk_food_tables" } } : uk;
   }
   const fallback = () => aiOrWebResult(food, aiResultPromise, grams, ml, { triedLabel });
 
@@ -1343,21 +1515,9 @@ function countedFood(food) {
   return { count: amount.count, single: `1 ${words.join(" ")}` };
 }
 
-/** A lookup through both caches (memory, then saved), saved when new. */
-async function cachedResolve(food) {
-  const key = normalizeFood(food);
-  const cacheKey = `resolve:v${RESOLVE_VERSION}:${key}`;
-  const cached = cache.get(cacheKey) || (await readSavedLookup(key));
-  if (cached) {
-    cache.set(cacheKey, cached, RESOLVE_TTL_SECONDS);
-    return cached;
-  }
-  const out = await resolveFood(food);
-  if (!out.failed) {
-    cache.set(cacheKey, out, RESOLVE_TTL_SECONDS);
-    saveLookup(key, food, out);
-  }
-  return out;
+/** A lookup through the saved answers, saved when new. */
+function cachedResolve(food) {
+  return lookupFood(food);
 }
 
 async function resolveCounted(food, { debug = false } = {}) {
@@ -1500,6 +1660,182 @@ function saveLookup(key, food, result) {
     })
     .catch((err) => console.warn("Saving lookup failed:", err.message));
 }
+
+// -------------------- Saved foods (any amount) --------------------
+// Each food once, any amount of it worked out with arithmetic: see
+// food_base.js. Kept for half a year, and started afresh whenever the
+// lookup itself changes (RESOLVE_VERSION).
+const FOOD_BASE_DAYS = 180;
+
+/** People who corrected a saved food before it's looked up again. */
+const CORRECTIONS_TO_FORGET = 3;
+
+function foodBaseRef(key) {
+  return getFirestore().collection("meta").doc("food_base").collection("items").doc(savedLookupId(key));
+}
+
+async function fromFoodBase(food) {
+  if (!SERVICE_ACCOUNT) return null;
+  const parsed = parseFood(food);
+  if (!parsed) return null;
+  try {
+    const d = (await foodBaseRef(parsed.key).get()).data();
+    if (!d || d.version !== RESOLVE_VERSION || d.key !== parsed.key) return null;
+    const saved = d.saved_at?.toMillis?.() ?? 0;
+    if (Date.now() - saved > FOOD_BASE_DAYS * 24 * 60 * 60 * 1000) return null;
+    return serve(parsed, food, d);
+  } catch (err) {
+    console.warn("Saved food read failed:", err.message);
+    return null;
+  }
+}
+
+/** Adds what a fresh answer says about the food to its saved record. */
+function learnFoodBase(food, result) {
+  if (!SERVICE_ACCOUNT) return;
+  const parsed = parseFood(food);
+  const fields = learn(parsed, result);
+  if (!fields) return;
+  const ref = foodBaseRef(parsed.key);
+  getFirestore()
+    .runTransaction(async (tx) => {
+      const d = (await tx.get(ref)).data();
+      const data = {
+        ...JSON.parse(JSON.stringify(fields)),
+        key: parsed.key,
+        version: RESOLVE_VERSION,
+        saved_at: FieldValue.serverTimestamp(),
+      };
+      // An older lookup's record (or another food's, in the unlikely
+      // event of the same id) is replaced, not mixed in.
+      if (!d || d.version !== RESOLVE_VERSION || d.key !== parsed.key) tx.set(ref, data);
+      else tx.set(ref, data, { merge: true });
+    })
+    .catch((err) => console.warn("Saving food failed:", err.message));
+}
+
+/** Clears remembered answers in memory (after a saved food is dropped). */
+function clearMemoryLookups() {
+  for (const k of cache.keys()) if (k.startsWith("resolve:")) cache.del(k);
+}
+
+/** Drops the saved answers for this text and for its food. */
+async function forgetFood(food) {
+  const key = normalizeFood(food);
+  const parsed = parseFood(food);
+  const jobs = [];
+  if (SERVICE_ACCOUNT) {
+    jobs.push(savedLookups().doc(savedLookupId(key)).delete());
+    if (parsed) jobs.push(foodBaseRef(parsed.key).delete());
+  }
+  await Promise.all(jobs);
+  clearMemoryLookups();
+  return { food: key, saved_food: parsed?.key ?? null };
+}
+
+const feedbackLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "Slow down a little." },
+});
+
+// Someone fixed the calories of a looked-up food. When enough different
+// people correct the same saved answer, it's dropped and looked up afresh
+// next time, so one bad answer can't stick for everyone.
+// Body: { food, calories } (calories for exactly what was typed, ×1).
+app.post("/food/feedback", requireFirebaseUser, feedbackLimiter, async (req, res) => {
+  const uid = req.user?.uid;
+  const food = typeof req.body?.food === "string" ? req.body.food : "";
+  const calories = Number(req.body?.calories);
+  if (!uid || !food.trim() || food.length > 200 || !Number.isFinite(calories) || calories < 0) {
+    return res.status(400).json({ error: "Which food?" });
+  }
+  if (!SERVICE_ACCOUNT) return res.json({ counted: false });
+  try {
+    const key = normalizeFood(food);
+    const served = (await readSavedLookup(key)) || (await fromFoodBase(food));
+    const was = Number(served?.calories);
+    // Nothing saved, or close enough to what we said: nothing to fix.
+    if (!(was > 0) || Math.abs(calories - was) <= Math.max(was * 0.15, 20)) {
+      return res.json({ counted: false });
+    }
+    const parsed = parseFood(food);
+    // Who corrected it, as a one-way hash: only needed to count people.
+    const who = savedLookupId(`fix:${uid}`);
+    const refs = [savedLookups().doc(savedLookupId(key))];
+    if (parsed) refs.push(foodBaseRef(parsed.key));
+    let forgot = false;
+    await getFirestore().runTransaction(async (tx) => {
+      const snaps = await Promise.all(refs.map((r) => tx.get(r)));
+      const by = new Set(snaps.flatMap((s) => (Array.isArray(s.data()?.corrected_by) ? s.data().corrected_by : [])));
+      by.add(who);
+      forgot = by.size >= CORRECTIONS_TO_FORGET;
+      snaps.forEach((snap, i) => {
+        if (!snap.exists) return;
+        if (forgot) tx.delete(refs[i]);
+        else tx.update(refs[i], { corrected_by: FieldValue.arrayUnion(who) });
+      });
+    });
+    if (forgot) {
+      clearMemoryLookups();
+      countEvent("food_saved_dropped");
+    }
+    return res.json({ counted: true, forgot });
+  } catch (err) {
+    console.warn("Food feedback failed:", err.message);
+    return res.json({ counted: false });
+  }
+});
+
+// Admin: saved answers people have corrected, most corrected first, for
+// the Food check screen (each one is a food the lookup got wrong for
+// someone: worth a look, and worth adding to the accuracy test).
+app.get("/admin/food-corrections", requireFirebaseUser, async (req, res) => {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: "Not allowed." });
+  if (!SERVICE_ACCOUNT) return res.json({ foods: [] });
+  try {
+    const corrected = (col) => col.where("corrected_by", "!=", null).limit(100).get();
+    const [texts, foods] = await Promise.all([
+      corrected(savedLookups()),
+      corrected(getFirestore().collection("meta").doc("food_base").collection("items")),
+    ]);
+    const people = (d) => (Array.isArray(d.corrected_by) ? d.corrected_by.length : 0);
+    const out = [
+      ...texts.docs.map((doc) => {
+        const d = doc.data();
+        return { food: String(d.food || ""), kind: "text", people: people(d),
+          calories: Math.round(Number(d.result?.calories) || 0), source: String(d.result?.source || "") };
+      }),
+      ...foods.docs.map((doc) => {
+        const d = doc.data();
+        return { food: String(d.key || ""), kind: "food", people: people(d),
+          calories: null, source: String(d.source || "") };
+      }),
+    ]
+      .filter((f) => f.food && f.people > 0)
+      .sort((a, b) => b.people - a.people);
+    return res.json({ foods: out });
+  } catch (err) {
+    console.error("Food corrections failed:", err.message);
+    return res.status(502).json({ error: "Couldn't load corrections" });
+  }
+});
+
+// Admin: drop a saved food now ("Forget saved answer" on Food check).
+app.post("/admin/food-forget", requireFirebaseUser, async (req, res) => {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: "Not allowed." });
+  const food = typeof req.body?.food === "string" ? req.body.food.trim() : "";
+  if (!food || food.length > 200) return res.status(400).json({ error: "Which food?" });
+  try {
+    return res.json({ forgot: await forgetFood(food) });
+  } catch (err) {
+    console.error("Forgetting food failed:", err.message);
+    return res.status(502).json({ error: "Couldn't forget that" });
+  }
+});
 
 // ======================================================================
 // ============================= MACRO TARGETS ===========================
