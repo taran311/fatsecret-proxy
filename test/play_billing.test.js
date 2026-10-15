@@ -38,6 +38,12 @@ test("cancelled keeps Premium to the end; grace period still counts", () => {
   assert.equal(playToBilling(sub("SUBSCRIPTION_STATE_IN_GRACE_PERIOD")).status, "past_due");
 });
 
+test("both product id styles map to the plan", () => {
+  assert.equal(playToBilling(sub("SUBSCRIPTION_STATE_ACTIVE", { product: "monthly" })).plan, "monthly");
+  assert.equal(playToBilling(sub("SUBSCRIPTION_STATE_ACTIVE", { product: "yearly" })).plan, "yearly");
+  assert.equal(playToBilling(sub("SUBSCRIPTION_STATE_ACTIVE", { product: "premium_yearly" })).plan, "yearly");
+});
+
 test("on hold, expired, pending and unknown are not paid", () => {
   for (const [state, status] of [
     ["SUBSCRIPTION_STATE_ON_HOLD", "on_hold"],

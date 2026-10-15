@@ -38,8 +38,10 @@ const PACKAGE = process.env.PLAY_PACKAGE || "com.thecaloriecard.app";
 const API = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications";
 const SCOPE = "https://www.googleapis.com/auth/androidpublisher";
 
-/** Play product id → our plan name. */
+/** Play product id → our plan name (both names are accepted). */
 export const PLAY_PRODUCTS = {
+  monthly: "monthly",
+  yearly: "yearly",
   premium_monthly: "monthly",
   premium_yearly: "yearly",
 };
