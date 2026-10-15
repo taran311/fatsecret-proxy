@@ -236,7 +236,10 @@ export function registerGifts(app, { requireFirebaseUser, firestoreReady }) {
       );
       const b = outcome.billing;
       const PAID = new Set(["active", "trialing", "past_due"]);
-      const stillPaying = !!b.stripe_subscription_id && PAID.has(b.status) && !b.cancel_at_period_end;
+      const stillPaying =
+        (!!b.stripe_subscription_id || !!b.play_purchase_token) &&
+        PAID.has(b.status) &&
+        !b.cancel_at_period_end;
       console.log(`[gift/redeem] ${uid} redeemed a code`);
       return res.json({ ok: true, stillPaying });
     } catch (err) {

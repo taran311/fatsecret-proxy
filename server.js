@@ -18,6 +18,7 @@ import {
   refundCoachMessage,
   isPremium,
 } from "./billing.js";
+import { registerPlayBilling } from "./play_billing.js";
 import { registerAccount } from "./account.js";
 import { registerGames } from "./games.js";
 import { registerChat } from "./chat.js";
@@ -116,8 +117,14 @@ async function requireFirebaseUser(req, res, next) {
   }
 }
 
-// -------------------- Premium (Stripe) --------------------
+// -------------------- Premium (Stripe and Google Play) --------------------
 registerBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
+// Premium bought in the Android app (Google Play).
+registerPlayBilling(app, {
+  requireFirebaseUser,
+  firestoreReady: !!SERVICE_ACCOUNT,
+  serviceAccount: SERVICE_ACCOUNT,
+});
 registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerGames(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerChat(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });

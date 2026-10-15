@@ -2,7 +2,8 @@
 //
 // Called from Profile → Account and privacy → Delete account, after the
 // user has typed DELETE. Removes everything the app stores about them,
-// cancels any Stripe subscription straight away, takes them out of other
+// cancels any Stripe subscription straight away (and stops a Google Play
+// one renewing), takes them out of other
 // people's friends lists, groups, challenges and games, then deletes their
 // sign-in. Each step is best-effort and logged, so one missing collection
 // or index never leaves the account half-deleted without trying the rest;
@@ -22,6 +23,7 @@
 import Stripe from "stripe";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
+import { cancelPlaySubscription } from "./play_billing.js";
 
 const OWNED_BY_USER_ID = [
   "user_data",
@@ -81,6 +83,12 @@ export async function deleteUserData(uid, { stripe } = {}) {
       if (err?.code === "resource_missing" || err?.statusCode === 404) return "gone";
       throw err;
     }
+  });
+
+  // Google Play subscriptions (bought in the Android app) stop renewing.
+  await step(log, "google play", async () => {
+    const billing = (await db.collection("billing").doc(uid).get()).data();
+    return cancelPlaySubscription(billing);
   });
 
   // 2. Their own data.

@@ -217,6 +217,23 @@ export async function refundCoachMessage(uid) {
   } catch (_) {}
 }
 
+const isPaid = (status, periodEnd, now = new Date()) =>
+  PAID_STATES.has(status) && !!periodEnd && periodEnd.getTime() > now.getTime();
+
+/**
+ * Whether a subscription from [store] ('stripe' or 'play'), now [paid] or
+ * not, may replace what billing/{uid} holds. A lapsed subscription in one
+ * store never wipes a running one in the other (someone who moved from the
+ * website to the Android app, or back). Exported for tests and
+ * play_billing.js.
+ */
+export function mayReplace(current, store, paid, now = new Date()) {
+  const c = current || {};
+  const currentStore = c.store || (c.stripe_subscription_id ? "stripe" : null);
+  if (!currentStore || currentStore === store || paid) return true;
+  return !isPaid(c.status, toDate(c.current_period_end), now);
+}
+
 function planForPrice(priceId) {
   if (!priceId) return null;
   for (const [plan, id] of Object.entries(PRICES)) if (id && id === priceId) return plan;
@@ -253,6 +270,8 @@ async function syncSubscription(sub, uidHint) {
 
   const data = await db().runTransaction(async (tx) => {
     const current = (await tx.get(ref)).data() || {};
+    // A running Google Play plan isn't wiped by a lapsed Stripe one.
+    if (!mayReplace(current, "stripe", isPaid(sub.status, periodEnd))) return current;
     // Keep the newest subscription's details if there are several.
     if (
       current.stripe_subscription_id &&
@@ -266,6 +285,7 @@ async function syncSubscription(sub, uidHint) {
     let metaSnap = null;
     if (founderNow && !current.founder) metaSnap = await tx.get(metaRef);
     const update = {
+      store: "stripe",
       status: sub.status,
       plan,
       current_period_end: periodEnd ? Timestamp.fromDate(periodEnd) : null,
@@ -499,6 +519,11 @@ export function registerBilling(app, { requireFirebaseUser, firestoreReady }) {
     }
     try {
       const billing = (await billingRef(uid).get()).data() || {};
+      if (billing.store === "play" && entitlementFrom(billing).subscribed) {
+        return res.status(409).json({
+          error: "Your plan is with Google Play: manage it in the Play Store on your phone.",
+        });
+      }
       if (!billing.stripe_customer_id) {
         return res.status(404).json({ error: "No subscription to manage yet." });
       }

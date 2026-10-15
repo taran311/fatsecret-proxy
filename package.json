@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "benchmark": "node benchmark/accuracy.js",
-    "test": "node --test test/food_base.test.js test/sources.test.js"
+    "test": "node --test test/food_base.test.js test/sources.test.js test/play_billing.test.js"
   },
   "keywords": [],
   "author": "",
