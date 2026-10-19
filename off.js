@@ -57,6 +57,56 @@ export function offProduct(p) {
   };
 }
 
+const NOT_PIECES = new Set([
+  "g", "gram", "grams", "kg", "ml", "l", "cl", "oz", "serving", "servings", "portion",
+  "portions", "pack", "packs", "packet", "box", "bag", "pot", "tub", "jar", "tin", "can",
+  "bottle", "tbsp", "tsp", "tablespoon", "teaspoon", "cup", "cups", "scoop", "scoops",
+]);
+const NUMBER_WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
+
+const stemWord = (w) => {
+  const x = w.replace(/'s$/, "");
+  return x.length > 3 && x.endsWith("s") && !x.endsWith("ss") ? x.slice(0, -1) : x;
+};
+const stems = (text) =>
+  String(text || "")
+    .toLowerCase()
+    .split(/[^a-z']+/)
+    .filter(Boolean)
+    .map(stemWord);
+
+/**
+ * How much one piece of [prod] weighs, from its label's serving when that
+ * serving is a number of pieces of the food asked for: "2 hash browns
+ * (88 g)" is 44 g a hash brown. So "2 McCain hash browns" is two of the
+ * pack's own hash browns, not two of the AI's guess at the size. Null when
+ * the serving isn't pieces ("100 g", "1 portion") or not of this food.
+ */
+export function pieceGrams(prod, food) {
+  const label = String(prod?.servingLabel || "").toLowerCase();
+  if (!label || prod?.liquid) return null;
+  const weight = label.match(/(\d+(?:[.,]\d+)?)\s*g\b/);
+  const grams = Number(prod.servingGrams) || (weight ? Number(weight[1].replace(",", ".")) : 0);
+  if (!(grams > 0)) return null;
+  // The pieces: "2 hash browns", also inside brackets ("88 g (2 hash browns)").
+  const text = label.replace(/(\d+(?:[.,]\d+)?)\s*(?:g|grams?|kcal|kj)\b/g, " ");
+  const m = text.match(/(?:^|[\s(])(\d+(?:\.\d+)?|one|two|three|four|five|six)\s+([a-z][a-z' -]*[a-z])/);
+  if (!m) return null;
+  const count = /^\d/.test(m[1]) ? Number(m[1]) : NUMBER_WORDS[m[1]];
+  const item = stems(m[2]).filter((w) => !NOT_PIECES.has(w) && w !== "x");
+  if (!(count > 0) || !item.length || NOT_PIECES.has(stems(m[2])[0])) return null;
+  // The piece has to be the food asked for: "hash brown" in "mccains
+  // hashbrown" (spaces don't matter), or "biscuit" in "3 oreo biscuits".
+  const want = stems(food);
+  const compact = want.join("");
+  const piece = item.join("");
+  const shared = item.some((w) => w.length >= 3 && want.includes(w));
+  if (!shared && !(piece.length >= 4 && compact.includes(piece))) return null;
+  const each = grams / count;
+  if (!(each >= 2 && each <= 500)) return null;
+  return { grams: each, label: String(prod.servingLabel).trim() };
+}
+
 const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
 
 /** Open Food Facts' name for a country: "GB" → "united-kingdom". */

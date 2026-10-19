@@ -39,7 +39,9 @@ function guessed(game, uid) {
 }
 
 function done(game, uid) {
-  const total = foodsFor(game, uid).length;
+  // Higher or Lower: the foods are pairs, one answer each.
+  const n = foodsFor(game, uid).length;
+  const total = game.mode === "higherLower" ? Math.floor(n / 2) : n;
   return total > 0 && guessed(game, uid) >= total;
 }
 
@@ -59,12 +61,14 @@ function isStale(game, now) {
 export function messageFor(game, from, to, event, now = new Date()) {
   const name = String(game.names?.[from] || "Your friend").slice(0, 40);
   const finished = game.status === "finished";
+  const hl = game.mode === "higherLower";
+  const title = hl ? "Higher or Lower" : "Guess the Calories";
 
   if (finished) {
     if (game.expired) return null;
     return {
       key: "finished",
-      title: "🏆 Guess the Calories: results are in",
+      title: `🏆 ${title}: results are in`,
       body: `${name} has finished. See who won!`,
     };
   }
@@ -76,7 +80,7 @@ export function messageFor(game, from, to, event, now = new Date()) {
   if (event === "nudge") {
     return {
       key: `nudge-${now.toISOString().slice(0, 10)}`,
-      title: "🎯 Your turn in Guess the Calories",
+      title: `${hl ? "⚖️" : "🎯"} Your turn in ${title}`,
       body: `${name} is waiting for you.`,
     };
   }
@@ -99,15 +103,17 @@ export function messageFor(game, from, to, event, now = new Date()) {
   if (game.mode !== "swap" && guessed(game, from) === 0 && guessed(game, to) === 0) {
     return {
       key: "challenge",
-      title: `🎯 ${name} challenged you`,
-      body: "Guess the Calories: 5 mystery foods. Closest guesses win.",
+      title: `${hl ? "⚖️" : "🎯"} ${name} challenged you`,
+      body: hl
+        ? "Higher or Lower: which has more calories? Most right wins."
+        : "Guess the Calories: 5 mystery foods. Closest guesses win.",
     };
   }
   if (done(game, from)) {
     return {
       key: "your-turn",
-      title: "🎯 Your turn in Guess the Calories",
-      body: `${name} has made their guesses. Your turn!`,
+      title: `${hl ? "⚖️" : "🎯"} Your turn in ${title}`,
+      body: `${name} has ${hl ? "played" : "made their guesses"}. Your turn!`,
     };
   }
   return null;

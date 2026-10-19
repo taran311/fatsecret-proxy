@@ -26,7 +26,7 @@ import { registerGifts, isAdmin } from "./gifts.js";
 import { registerAnalytics, countEvent } from "./analytics.js";
 import { readFileSync } from "node:fs";
 import { parseFood, plausible, learn, serve } from "./food_base.js";
-import { createOffSearch, offDescription } from "./off.js";
+import { createOffSearch, offDescription, pieceGrams } from "./off.js";
 import { loadCofid, cofidDescription } from "./cofid.js";
 import { RECIPE_IMPORT_PROMPT, cleanImport, readImages } from "./recipe_import.js";
 
@@ -1366,7 +1366,11 @@ const off = createOffSearch({
  */
 async function offLookup(food, { brand, ai, grams, ml, aiWeight, country }) {
   // Two passes share one search (it's remembered), so this costs one.
-  if (!aiWeight && !grams && !ml) return null;
+  // A number of pieces ("2 McCain hash browns") can use the pack's own
+  // piece weight on the first pass.
+  const amount = !grams && !ml ? extractCountAndUnit(food) : null;
+  const pieces = amount && (!amount.unit || ITEM_UNITS.has(amount.unit)) ? amount : null;
+  if (!aiWeight && !grams && !ml && !pieces) return null;
   const terms = cleanQueryForFatSecret(food, []);
   const products = await off.search(terms, country);
   if (!products?.length) return null;
@@ -1392,12 +1396,15 @@ async function offLookup(food, { brand, ai, grams, ml, aiWeight, country }) {
 
   let qty = null; // grams, or ml for a drink
   let volume = false;
+  let piece = null;
   if (ml) {
     if (!p.liquid) return null; // per 100g can't be poured into ml
     qty = ml;
     volume = true;
   } else if (grams) {
     qty = grams;
+  } else if (pieces && (piece = pieceGrams(p, food))) {
+    qty = piece.grams * pieces.count;
   } else if (aiWeight) {
     const w = toPositiveNumberOrNull(p.liquid ? ai?.ml : ai?.grams);
     if (!w || ai?.failed) return null;
@@ -1419,7 +1426,18 @@ async function offLookup(food, { brand, ai, grams, ml, aiWeight, country }) {
     carbs: round1(p.per100.carbs * f),
     fat: round1(p.per100.fat * f),
     confidence: 0.9,
-    basis: `${Math.round(p.per100.calories)} kcal/100${unit} × ${Math.round(qty)}${unit} (Open Food Facts)`,
+    ...(piece
+      ? {
+          ...(pieces.count !== 1
+            ? { serving_description: `${fmtAmount(pieces.count)} × ${Math.round(piece.grams)}g` }
+            : {}),
+          basis:
+            `${Math.round(p.per100.calories)} kcal/100g × ${fmtAmount(pieces.count)} × ` +
+            `${Math.round(piece.grams)}g (Open Food Facts serving "${piece.label}")`,
+        }
+      : {
+          basis: `${Math.round(p.per100.calories)} kcal/100${unit} × ${Math.round(qty)}${unit} (Open Food Facts)`,
+        }),
   };
 }
 
@@ -1742,7 +1760,7 @@ app.post("/admin/food-check", requireFirebaseUser, ensureFatSecretToken, async (
 // slightly different AI guess each week), and isn't paid for twice.
 // Bump RESOLVE_VERSION when the lookup logic changes, so old answers are
 // looked up again. Server-only: under meta/, which the app can't read.
-const RESOLVE_VERSION = 15;
+const RESOLVE_VERSION = 16;
 const SAVED_LOOKUP_DAYS = 60;
 
 function savedLookups() {
