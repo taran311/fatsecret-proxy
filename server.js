@@ -1325,13 +1325,18 @@ async function lookupFood(food, { debug = false, country = DEFAULT_COUNTRY, refr
     countEvent("food_lookup_refresh");
   }
   if (!debug && !refresh) {
-    const cached = cache.get(cacheKey) || (await readSavedLookup(key));
+    const memory = cache.get(cacheKey);
+    // Both saved records at once (the second is only used if the first
+    // isn't there), rather than one read after the other.
+    const [saved, fromSaved] = memory
+      ? [memory, null]
+      : await Promise.all([readSavedLookup(key), fromFoodBase(food, country)]);
+    const cached = memory || saved;
     if (cached) {
       cache.set(cacheKey, cached, RESOLVE_TTL_SECONDS);
       countEvent("food_lookup_saved");
       return cached;
     }
-    const fromSaved = await fromFoodBase(food, country);
     if (fromSaved) {
       countEvent("food_lookup_saved");
       return fromSaved;
@@ -1452,7 +1457,11 @@ console.log(`UK food tables: ${COFID.size} foods`);
  * weight for what was described ("1 banana", "a bowl of rice"). Null if
  * nothing in the tables is clearly that food.
  */
-async function cofidLookup(food, { ai, grams, ml, country }) {
+/**
+ * Which UK food tables entry [food] is, or null. Doesn't need the AI
+ * estimate, so it's started alongside it (see resolveFood).
+ */
+async function cofidPick(food, country) {
   // UK foods and recipes: for people in the UK and Ireland.
   if (!COFID.size || !COFID_COUNTRIES.has(country)) return null;
   const candidates = COFID.search(food, 10);
@@ -1469,7 +1478,12 @@ async function cofidLookup(food, { ai, grams, ml, country }) {
   if (!(pick.index >= 0 && pick.index < candidates.length) || pick.confidence < MIN_DB_AI_PICK_CONF) {
     return null;
   }
-  const f = candidates[pick.index];
+  return candidates[pick.index];
+}
+
+async function cofidLookup(food, { ai, grams, ml, country, picked }) {
+  const f = await (picked ?? cofidPick(food, country));
+  if (!f) return null;
   // Most drinks weigh about what their volume is (1ml ≈ 1g); alcoholic
   // drinks are given per 100ml in the tables anyway.
   const aiAmount = ai?.failed ? null : toPositiveNumberOrNull(ai?.grams) ?? toPositiveNumberOrNull(ai?.ml);
@@ -1530,6 +1544,10 @@ async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = 
     console.error("AI estimate failed:", err.response?.data || err.message || err);
     return aiFailure(food);
   });
+  // The UK food tables match (for everyday foods) starts now too, rather
+  // than after the AI estimate: it only needs the words. Unused if the AI
+  // says it's a branded product.
+  const cofidPicked = cofidPick(food, country).catch(() => null);
 
   const grams = extractExplicitGrams(food);
   const ml = extractExplicitMl(food);
@@ -1572,7 +1590,7 @@ async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = 
   } else {
     // An everyday food with no brand: the UK government food tables (for
     // people in the UK).
-    const uk = await cofidLookup(food, { ai, grams, ml, country });
+    const uk = await cofidLookup(food, { ai, grams, ml, country, picked: cofidPicked });
     if (uk) return debug ? { ...uk, debug: { used: "uk_food_tables" } } : uk;
   }
   const fallback = () => aiOrWebResult(food, aiResultPromise, grams, ml, { triedLabel, country });
