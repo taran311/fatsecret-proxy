@@ -28,6 +28,7 @@ import { readFileSync } from "node:fs";
 import { parseFood, plausible, learn, serve } from "./food_base.js";
 import { createOffSearch, offDescription } from "./off.js";
 import { loadCofid, cofidDescription } from "./cofid.js";
+import { RECIPE_IMPORT_PROMPT, cleanImport, readImages } from "./recipe_import.js";
 
 dotenv.config();
 
@@ -62,7 +63,9 @@ const smallJson = bodyParser.json({ limit: "20kb" });
 const photoJson = bodyParser.json({ limit: "6mb" });
 // Stripe's webhook needs the raw body (it's signed), so it skips this too.
 app.use((req, res, next) =>
-  req.path === "/food/photo" || req.path === "/billing/webhook"
+  req.path === "/food/photo" ||
+  req.path === "/recipe/from-image" ||
+  req.path === "/billing/webhook"
     ? next()
     : smallJson(req, res, next)
 );
@@ -2369,6 +2372,75 @@ app.post("/food/photo", requireFirebaseUser, photoLimiter, photoJson, async (req
     return res.status(502).json({ error: "Couldn't read that photo" });
   }
 });
+
+// Reads a recipe from up to 3 screenshots or photos (another app's recipe,
+// a website, a cookbook): the ingredient lines with amounts, plus any
+// calories printed beside them. The app looks every ingredient up itself;
+// the printed calories are only for "ours vs the screenshot".
+const recipeImportLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: Number(process.env.RECIPE_IMPORT_RATE_LIMIT_PER_HOUR) || 15,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "Too many recipe imports this hour, try again later." },
+});
+
+app.post(
+  "/recipe/from-image",
+  requireFirebaseUser,
+  recipeImportLimiter,
+  photoJson,
+  async (req, res) => {
+    if (!(await isPremium(req.user?.uid))) {
+      return res.status(402).json({
+        error: "Importing recipes from images is part of Premium.",
+        code: "premium_required",
+      });
+    }
+    const { images, error } = readImages(req.body);
+    if (error) return res.status(400).json({ error });
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "AI is not configured" });
+    }
+    try {
+      const response = await openai.responses.create({
+        model: AI_MODEL,
+        temperature: 0,
+        text: { format: { type: "json_object" } },
+        input: [
+          { role: "system", content: RECIPE_IMPORT_PROMPT },
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text:
+                  images.length > 1
+                    ? `These ${images.length} images show one recipe. List its ingredients.`
+                    : "List this recipe's ingredients.",
+              },
+              ...images.map((im) => ({
+                type: "input_image",
+                image_url: `data:${im.mime};base64,${im.image}`,
+              })),
+            ],
+          },
+        ],
+      });
+      let parsed = {};
+      try {
+        parsed = JSON.parse(response.output_text || "{}");
+      } catch (_) {}
+      const result = cleanImport(parsed);
+      countEvent("recipe_imported");
+      return res.json(result);
+    } catch (err) {
+      console.error("Recipe import error:", err?.response?.data || err.message || err);
+      return res.status(502).json({ error: "Couldn't read that image" });
+    }
+  }
+);
 
 // -------------------- Calorie Coach --------------------
 // A friendly chat about your day. The app sends today's numbers (balance,
