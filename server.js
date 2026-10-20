@@ -1006,12 +1006,17 @@ const UNSURE = 0.6; // the app shows "Check this" below this
  *  empty. Null if it couldn't be found. */
 async function labelLookup(food, grams, ml, country) {
   for (let attempt = 0; attempt < 2; attempt++) {
+    const started = Date.now();
     try {
       const web = await webLookup(food, grams, ml, country);
       if (web) return web;
     } catch (err) {
       console.error("Web lookup failed:", err.response?.data || err.message || err);
     }
+    // Try again only when the search came back suspiciously quickly (an
+    // empty search): one that searched properly and found nothing would
+    // just take as long again to find nothing.
+    if (Date.now() - started > 4000) break;
   }
   return null;
 }
@@ -1027,7 +1032,30 @@ async function aiOrWebResult(food, aiResultPromise, grams, ml, { triedLabel = fa
 }
 
 // -------------------- AI: choose best DB candidate among top-N --------------------
-async function pickBestCandidateIndex(query, candidates) {
+/** The same pick asked twice in one lookup (Open Food Facts' two passes
+ *  share their candidates): asked once. */
+const pickMemo = new Map();
+
+function pickBestCandidateIndex(query, candidates) {
+  const key = `${normalizeFood(query)}|${JSON.stringify(candidates)}`;
+  const known = cache.get(`pick:${key}`);
+  if (known) return Promise.resolve(known);
+  if (pickMemo.has(key)) return pickMemo.get(key);
+  const p = pickBestCandidateIndexFresh(query, candidates)
+    .then((r) => {
+      try {
+        cache.set(`pick:${key}`, r, 600);
+      } catch {
+        // The cache is full: fine, it's only a shortcut.
+      }
+      return r;
+    })
+    .finally(() => pickMemo.delete(key));
+  pickMemo.set(key, p);
+  return p;
+}
+
+async function pickBestCandidateIndexFresh(query, candidates) {
   if (!process.env.OPENAI_API_KEY) return { index: -1, confidence: 0, failed: true };
 
   const simplified = candidates.map((c, i) => ({
@@ -1533,12 +1561,33 @@ function crossCheck(result, ai) {
  * search + pick run at the same time, so it takes about as long as the
  * slower of the two, not both added up.
  */
-async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = {}) {
+/** Lookups slower than this are logged with where the time went. */
+const SLOW_LOOKUP_MS = Number(process.env.SLOW_LOOKUP_MS) || 4000;
+
+async function resolveFood(food, opts = {}) {
+  const started = Date.now();
+  const marks = [];
+  const mark = (label) => marks.push(`${label} ${((Date.now() - started) / 1000).toFixed(1)}s`);
+  const out = await resolveFoodSteps(food, { ...opts, mark });
+  const ms = Date.now() - started;
+  if (ms >= SLOW_LOOKUP_MS) {
+    console.log(
+      `Slow lookup ${(ms / 1000).toFixed(1)}s "${String(food).slice(0, 60)}" → ` +
+        `${out?.source || "?"}${out?.failed ? " (failed)" : ""} | ${marks.join(", ")}`
+    );
+  }
+  return out;
+}
+
+async function resolveFoodSteps(food, { debug = false, country = DEFAULT_COUNTRY, mark = () => {} } = {}) {
   // "3 Weetabix", "half an avocado", "2 crumpets": one item, looked up
   // once (and remembered), times the number. So a number of something
   // always agrees with one of it, and gives the same answer every time.
   const counted = await resolveCounted(food, { debug, country });
-  if (counted) return counted;
+  if (counted) {
+    mark("counted");
+    return counted;
+  }
 
   const aiResultPromise = estimateAI(food, country).catch((err) => {
     console.error("AI estimate failed:", err.response?.data || err.message || err);
@@ -1568,10 +1617,12 @@ async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = 
   // 2. the label online (it can count: "3 hash browns" off the pack);
   // 3. Open Food Facts with the AI's weight for the amount.
   const ai = await aiResultPromise;
+  mark("ai");
   const brand = ai.failed ? null : cleanBrand(ai.brand);
   let triedLabel = false;
   if (brand) {
     const off = await offLookup(food, { brand, ai, grams, ml, aiWeight: false, country });
+    mark("open_food_facts");
     if (off) {
       const checked = crossCheck(off, ai);
       return debug ? { ...checked, debug: { used: "open_food_facts", brand } } : checked;
@@ -1579,6 +1630,7 @@ async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = 
     if (WEB_LOOKUP && process.env.OPENAI_API_KEY) {
       triedLabel = true;
       const found = await labelLookup(food, grams, ml, country);
+      mark("label_online");
       const label = found && crossCheck(found, ai);
       if (label) return debug ? { ...label, debug: { used: "label", brand } } : label;
     }
@@ -1591,12 +1643,18 @@ async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = 
     // An everyday food with no brand: the UK government food tables (for
     // people in the UK).
     const uk = await cofidLookup(food, { ai, grams, ml, country, picked: cofidPicked });
+    mark("uk_tables");
     if (uk) return debug ? { ...uk, debug: { used: "uk_food_tables" } } : uk;
   }
-  const fallback = () => aiOrWebResult(food, aiResultPromise, grams, ml, { triedLabel, country });
+  const fallback = async () => {
+    const r = await aiOrWebResult(food, aiResultPromise, grams, ml, { triedLabel, country });
+    mark(r?.source === "web" ? "label_online_fallback" : "ai_answer");
+    return r;
+  };
 
   try {
     const primary = await primaryPromise;
+    mark("fatsecret");
     if (primary.error) throw primary.error;
     if (primary.upgraded) return primary.out;
 
@@ -1608,6 +1666,7 @@ async function resolveFood(food, { debug = false, country = DEFAULT_COUNTRY } = 
         query: cleaned,
         phaseLabel: "cleaned_retry",
       });
+      mark("fatsecret_retry");
       if (cleanedRetry.upgraded) return cleanedRetry.out;
 
       const aiResult = await fallback();
