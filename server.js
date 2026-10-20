@@ -1307,6 +1307,72 @@ function aiFailure(food) {
 // -------------------- AI-first Hybrid Resolve --------------------
 // The AI estimate and the database search + pick run at the same time, so
 // a lookup takes about as long as the slower of the two, not both added up.
+/**
+ * The AI estimate for [food], shared: the full lookup and the app's quick
+ * "estimate first" request (/food/estimate) ask at about the same time,
+ * and get the one answer (paid for once). Kept a couple of minutes.
+ */
+const estimatesInFlight = new Map();
+
+function estimateShared(food, country) {
+  const key = `est:${country}|${normalizeFood(food)}`;
+  const known = cache.get(key);
+  if (known) return Promise.resolve(known);
+  if (estimatesInFlight.has(key)) return estimatesInFlight.get(key);
+  const p = estimateAI(food, country)
+    .then((r) => {
+      if (r && !r.failed) {
+        try {
+          cache.set(key, r, 120);
+        } catch {
+          // Cache full: it's only a shortcut.
+        }
+      }
+      return r;
+    })
+    .finally(() => estimatesInFlight.delete(key));
+  estimatesInFlight.set(key, p);
+  return p;
+}
+
+const estimateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.ESTIMATE_RATE_LIMIT_PER_MIN) || 60,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: userOrIpKey,
+  message: { error: "Too many requests, slow down a little." },
+});
+
+/**
+ * A quick first answer while the full lookup (/food/resolve) is still
+ * working, so the app can show numbers straight away and swap in the
+ * label's when they arrive. A food already looked up comes back as its
+ * real answer (final: true); otherwise the AI's estimate (final: false).
+ * Never saved: only the full lookup's answer is.
+ */
+app.post("/food/estimate", requireFirebaseUser, estimateLimiter, async (req, res) => {
+  const { food } = req.body || {};
+  const country = normCountry(req.body?.country);
+  if (!food || typeof food !== "string" || !food.trim() || food.length > 200) {
+    return res.status(400).json({ error: "food is required" });
+  }
+  try {
+    const key = savedKey(country, food);
+    const saved =
+      cache.get(`resolve:v${RESOLVE_VERSION}:${key}`) || (await readSavedLookup(key));
+    if (saved) return res.json({ ...saved, final: true });
+    const ai = await estimateShared(food, country);
+    if (!ai || ai.failed || !(Number(ai.calories) > 0)) {
+      return res.status(502).json({ error: "No estimate yet" });
+    }
+    return res.json({ ...ai, final: false });
+  } catch (err) {
+    console.error("Estimate failed:", err.message || err);
+    return res.status(502).json({ error: "No estimate yet" });
+  }
+});
+
 app.post("/food/resolve", requireFirebaseUser, foodLimiter, ensureFatSecretToken, async (req, res) => {
   const { food, debug } = req.body || {};
   const country = normCountry(req.body?.country);
@@ -1589,7 +1655,7 @@ async function resolveFoodSteps(food, { debug = false, country = DEFAULT_COUNTRY
     return counted;
   }
 
-  const aiResultPromise = estimateAI(food, country).catch((err) => {
+  const aiResultPromise = estimateShared(food, country).catch((err) => {
     console.error("AI estimate failed:", err.response?.data || err.message || err);
     return aiFailure(food);
   });
