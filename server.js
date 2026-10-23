@@ -19,6 +19,7 @@ import {
   isPremium,
 } from "./billing.js";
 import { registerPlayBilling } from "./play_billing.js";
+import { registerAppleBilling } from "./apple_billing.js";
 import { registerAccount } from "./account.js";
 import { registerGames } from "./games.js";
 import { registerChat } from "./chat.js";
@@ -61,11 +62,14 @@ app.use(
 // (base64) get a bigger limit, parsed only after the user is signed in.
 const smallJson = bodyParser.json({ limit: "20kb" });
 const photoJson = bodyParser.json({ limit: "6mb" });
-// Stripe's webhook needs the raw body (it's signed), so it skips this too.
+// Stripe's webhook needs the raw body (it's signed), so it skips this too,
+// and Apple's notifications (three signed certificate chains) get their own
+// bigger limit.
 app.use((req, res, next) =>
   req.path === "/food/photo" ||
   req.path === "/recipe/from-image" ||
-  req.path === "/billing/webhook"
+  req.path === "/billing/webhook" ||
+  req.path === "/billing/apple/notifications"
     ? next()
     : smallJson(req, res, next)
 );
@@ -120,7 +124,7 @@ async function requireFirebaseUser(req, res, next) {
   }
 }
 
-// -------------------- Premium (Stripe and Google Play) --------------------
+// -------------------- Premium (Stripe, Google Play and the App Store) --------------------
 registerBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 // Premium bought in the Android app (Google Play).
 registerPlayBilling(app, {
@@ -128,6 +132,8 @@ registerPlayBilling(app, {
   firestoreReady: !!SERVICE_ACCOUNT,
   serviceAccount: SERVICE_ACCOUNT,
 });
+// Premium bought in the iPhone app (the App Store).
+registerAppleBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerGames(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerChat(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });

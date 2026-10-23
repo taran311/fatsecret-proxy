@@ -221,7 +221,7 @@ const isPaid = (status, periodEnd, now = new Date()) =>
   PAID_STATES.has(status) && !!periodEnd && periodEnd.getTime() > now.getTime();
 
 /**
- * Whether a subscription from [store] ('stripe' or 'play'), now [paid] or
+ * Whether a subscription from [store] ('stripe', 'play' or 'apple'), now [paid] or
  * not, may replace what billing/{uid} holds. A lapsed subscription in one
  * store never wipes a running one in the other (someone who moved from the
  * website to the Android app, or back). Exported for tests and
@@ -522,6 +522,12 @@ export function registerBilling(app, { requireFirebaseUser, firestoreReady }) {
       if (billing.store === "play" && entitlementFrom(billing).subscribed) {
         return res.status(409).json({
           error: "Your plan is with Google Play: manage it in the Play Store on your phone.",
+        });
+      }
+      if (billing.store === "apple" && entitlementFrom(billing).subscribed) {
+        return res.status(409).json({
+          error:
+            "Your plan is with the App Store: manage it on your iPhone in Settings → your name → Subscriptions.",
         });
       }
       if (!billing.stripe_customer_id) {
