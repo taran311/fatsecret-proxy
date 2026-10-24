@@ -42,7 +42,12 @@ app.use(compression());
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (origin === "https://thecaloriecard.com") return callback(null, true);
+      const allowed = [
+        "https://thecaloriecard.com",
+        "https://calorieknight.com",
+        "https://www.calorieknight.com",
+      ];
+      if (allowed.includes(origin)) return callback(null, true);
       if (
         !origin ||
         origin.startsWith("http://localhost:") ||
