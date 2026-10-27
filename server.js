@@ -256,6 +256,17 @@ async function ensureFatSecretToken(req, res, next) {
 // -------------------- Health --------------------
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
+// -------------------- App config --------------------
+// The oldest Android build (version code, e.g. 20 for 1.3.2+20) that may
+// still be used. Older ones show "Please update" until they're updated.
+// Set ANDROID_MIN_BUILD on Render only for a serious bug (broken sign-in,
+// bad data); leave it unset normally.
+app.get("/app/config", (req, res) => {
+  const min = Number.parseInt(process.env.ANDROID_MIN_BUILD || "0", 10);
+  res.set("Cache-Control", "no-store");
+  res.json({ android_min_build: Number.isFinite(min) && min > 0 ? min : 0 });
+});
+
 // ======================================================================
 // ========================= HYBRID RESOLVE ENGINE =======================
 // ======================================================================
