@@ -168,7 +168,7 @@ async function maybeClaim(uid) {
   const ref = claimsRef().doc(uid);
   if ((await ref.get()).exists) return;
   const mine = await createdAt(uid);
-  if (!mine) return;
+  if (!mine || Date.now() - mine.getTime() > NEW_ACCOUNT_DAYS * DAY) return;
   const requests = await friendRequests(uid);
   if (!requests.length) return;
   const others = [...new Set(requests.map((r) => (r.from === uid ? r.to : r.from)))];
@@ -258,6 +258,13 @@ export function registerReferrals(app, { requireFirebaseUser, firestoreReady }) 
     if (!firestoreReady) return res.status(503).json({ error: "Not available right now." });
     try {
       await maybeClaim(uid);
+      // Friends you've just added who are new: they count for you even
+      // before their own app checks in.
+      const mine = await friendRequests(uid);
+      const others = [...new Set(mine.map((r) => (r.from === uid ? r.to : r.from)))]
+        .filter((o) => o && o !== uid)
+        .slice(0, 20);
+      for (const o of others) await maybeClaim(o).catch(() => {});
 
       // Me as the invited one.
       let invitedBy = null;
