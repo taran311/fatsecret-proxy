@@ -24,6 +24,7 @@ import { registerAccount } from "./account.js";
 import { registerGames } from "./games.js";
 import { registerChat } from "./chat.js";
 import { registerGifts, isAdmin } from "./gifts.js";
+import { registerReferrals } from "./referrals.js";
 import { registerAnalytics, countEvent } from "./analytics.js";
 import { readFileSync } from "node:fs";
 import { parseFood, plausible, learn, serve } from "./food_base.js";
@@ -143,6 +144,7 @@ registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT })
 registerGames(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerChat(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerGifts(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
+registerReferrals(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerAnalytics(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 
 // Per-user limits (falls back to IP when auth is off). Keeps a leaked or

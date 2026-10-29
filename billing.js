@@ -77,7 +77,19 @@ export function entitlementFrom(data, now = new Date()) {
     lifetime ||
     (PAID_STATES.has(d.status) && !!periodEnd && periodEnd.getTime() > now.getTime());
   const inTrial = !subscribed && !!trialEnd && trialEnd.getTime() > now.getTime();
-  return { premium: subscribed || inTrial, subscribed, inTrial, lifetime, trialEnd, periodEnd };
+  // Free time from inviting friends (referrals.js): Premium like the trial.
+  const bonusUntil = toDate(d.bonus_until);
+  const inBonus = !subscribed && !!bonusUntil && bonusUntil.getTime() > now.getTime();
+  return {
+    premium: subscribed || inTrial || inBonus,
+    subscribed,
+    inTrial,
+    inBonus,
+    lifetime,
+    trialEnd,
+    periodEnd,
+    bonusUntil,
+  };
 }
 
 /**
@@ -325,6 +337,9 @@ async function sendTrialNotices(now = new Date()) {
     try {
       const data = doc.data();
       if (data.trial_notice_sent || entitlementFrom(data, now).subscribed) continue;
+      // Free time from inviting friends carries on after the trial.
+      const afterTrial = new Date((toDate(data.trial_ends_at)?.getTime() ?? 0) + DAY_MS);
+      if (entitlementFrom(data, afterTrial).inBonus) continue;
       await doc.ref.set({ trial_notice_sent: true }, { merge: true });
       const user = (await userRef(doc.id).get()).data() || {};
       const tokens = Array.isArray(user.fcm_tokens)
