@@ -1,7 +1,10 @@
-// One-off fix (app 1.3.9): savings that went into the pot when a new day
-// started weren't taken back if food was then added to that day (it stays
-// open until midnight). This finds those days in the current week (older
-// pots have already emptied) and takes the extra back out of the pot.
+// One-off fix for two pot bugs, this week only (older pots have already
+// emptied):
+//  1. Savings went into the pot when a new day started even if the day was
+//     never closed. Now only closed days save: those are taken back. If
+//     the day is yesterday, closing it before midnight saves it again.
+//  2. Food added to a day after its savings went in didn't take them back
+//     (app 1.3.9 fixes that from now on): the extra is taken back.
 //
 // Only ever lowers a pot. Days where food was removed afterwards are left
 // alone, and so is anything already moved onto someone's card: the pot
@@ -99,8 +102,10 @@ async function main() {
       .filter((e) => e.foodCategory !== "Recipe");
 
     let pot = num(u.pot);
+    const yesterday = days.length ? dayKey(new Date(Date.now() - 86400000)) : null;
     for (const day of days) {
       const depositDay = nextKey(day.date_key);
+      const open = day.finished !== true;
       let eatenBefore = 0;
       let late = 0;
       for (const e of food) {
@@ -112,19 +117,36 @@ async function main() {
         else eatenBefore += num(e.food_calories);
       }
       const saved = num(day.pot_saved);
-      const fixed = correctedSaved({ saved, paid: num(day.plan_paid), goal, eatenBefore, late });
+      const fixed = open
+        ? 0
+        : correctedSaved({ saved, paid: num(day.plan_paid), goal, eatenBefore, late });
       if (fixed >= saved) continue;
       const back = Math.min(saved - fixed, pot);
       console.log(
-        `${uid}  ${day.date_key}: saved ${saved}, ${Math.round(late)} added after → should be ${fixed}; ` +
-          `pot ${pot} → ${pot - back}`
+        `${uid}  ${day.date_key}: saved ${saved}, ` +
+          (open ? "day never closed" : `${Math.round(late)} added after`) +
+          ` → should be ${fixed}; pot ${pot} → ${pot - back}`
       );
       pot -= back;
       taken += back;
       fixedDays++;
       if (apply) {
+        // Yesterday can still be closed (until midnight), which saves it
+        // properly: leave it waiting for that.
+        const reopen = open && day.date_key === yesterday;
+        const paid = num(day.plan_paid);
         await day.ref.set(
-          { pot_saved: fixed, pot_fix: { was: saved, at: FieldValue.serverTimestamp() } },
+          {
+            pot_saved: fixed,
+            pot_fix: { was: saved, at: FieldValue.serverTimestamp() },
+            ...(reopen
+              ? {
+                  pot_pending: true,
+                  pot_left: Math.max(saved + paid, goal - eatenBefore) - late,
+                  pot_eaten: eatenBefore + late,
+                }
+              : {}),
+          },
           { merge: true }
         );
       }
