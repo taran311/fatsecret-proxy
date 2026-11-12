@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "benchmark": "node benchmark/accuracy.js",
-    "test": "node --test test/food_base.test.js test/sources.test.js test/play_billing.test.js test/apple_billing.test.js test/recipe_import.test.js test/pieces.test.js test/referrals.test.js"
+    "test": "node --test test/food_base.test.js test/sources.test.js test/play_billing.test.js test/apple_billing.test.js test/recipe_import.test.js test/pieces.test.js test/referrals.test.js test/bowbound.test.js"
   },
   "keywords": [],
   "author": "",
@@ -17,9 +17,9 @@
     "compression": "^1.7.5",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
-    "express": "^4.21.1",
+    "express": "^4.22.3",
     "express-rate-limit": "^7.5.0",
-    "firebase-admin": "^13.0.0",
+    "firebase-admin": "^13.10.0",
     "node-cache": "^5.1.2",
     "openai": "^6.21.0",
     "stripe": "^17.7.0"

@@ -20,6 +20,7 @@ import {
 } from "./billing.js";
 import { registerPlayBilling } from "./play_billing.js";
 import { registerAppleBilling } from "./apple_billing.js";
+import { registerBowbound, WEBHOOK_PATH as BOWBOUND_WEBHOOK } from "./bowbound.js";
 import { registerAccount } from "./account.js";
 import { registerGames } from "./games.js";
 import { registerChat } from "./chat.js";
@@ -75,6 +76,7 @@ app.use((req, res, next) =>
   req.path === "/food/photo" ||
   req.path === "/recipe/from-image" ||
   req.path === "/billing/webhook" ||
+  req.path === BOWBOUND_WEBHOOK ||
   req.path === "/billing/apple/notifications"
     ? next()
     : smallJson(req, res, next)
@@ -140,6 +142,8 @@ registerPlayBilling(app, {
 });
 // Premium bought in the iPhone app (the App Store).
 registerAppleBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
+// Bowbound (a separate game) records its Stripe purchases through this server.
+registerBowbound(app);
 registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerGames(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerChat(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
