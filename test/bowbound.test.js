@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { signedByStripe, grantFor } from "../bowbound.js";
+import { signedByStripe, grantFor, isBowboundAdmin, newCode, normaliseCode, displayCode } from "../bowbound.js";
 
 const secret = "whsec_test";
 const body = Buffer.from(JSON.stringify({ type: "checkout.session.completed" }));
@@ -37,4 +37,27 @@ test("skips other events, unpaid sessions and checkouts with no account", () => 
   assert.equal(grantFor(paid({ payment_status: "unpaid" })).skip, "not paid yet");
   assert.equal(grantFor(paid({ client_reference_id: null })).skip, "no account");
   assert.equal(grantFor(paid({ client_reference_id: "../grants/x" })).skip, "no account");
+});
+
+test("gift codes survive being typed loosely, and bad ones are refused", () => {
+  const code = newCode();
+  assert.equal(code.length, 8);
+  assert.equal(normaliseCode(displayCode(code)), code);
+  assert.equal(normaliseCode(` ${displayCode(code).toLowerCase().replace(/-/g, " ")} `), code);
+  assert.equal(normaliseCode(code), code);
+  assert.equal(normaliseCode("BOW-0000-0000"), null); // 0 isn't in the alphabet
+  assert.equal(normaliseCode("BOW-7KQ2"), null);
+  assert.equal(normaliseCode(""), null);
+});
+
+test("only the listed, verified emails are admins", () => {
+  const u = (email, emailVerified = true) => ({ uid: "x", email, emailVerified });
+  assert.equal(isBowboundAdmin(u("vegthetics@gmail.com"), ""), true);
+  assert.equal(isBowboundAdmin(u("VegtheticsBodybuilding@Gmail.com"), ""), true);
+  assert.equal(isBowboundAdmin(u("taz_dh@hotmail.com"), ""), true);
+  assert.equal(isBowboundAdmin(u("taz_dh@hotmail.com", false), ""), false); // unverified
+  assert.equal(isBowboundAdmin(u("someone@else.com"), ""), false);
+  assert.equal(isBowboundAdmin(null, ""), false);
+  assert.equal(isBowboundAdmin(u("vegthetics@gmail.com"), "other@x.com"), false); // the setting replaces the list
+  assert.equal(isBowboundAdmin(u("other@x.com"), "other@x.com"), true);
 });

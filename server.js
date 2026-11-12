@@ -48,6 +48,8 @@ app.use(
         "https://thecaloriecard.com",
         "https://calorieknight.com",
         "https://www.calorieknight.com",
+        "https://bowbound.com",
+        "https://www.bowbound.com",
       ];
       if (allowed.includes(origin)) return callback(null, true);
       if (
