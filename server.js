@@ -145,7 +145,7 @@ registerPlayBilling(app, {
 // Premium bought in the iPhone app (the App Store).
 registerAppleBilling(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 // Bowbound (a separate game) records its Stripe purchases through this server.
-registerBowbound(app);
+registerBowbound(app, { playServiceAccount: SERVICE_ACCOUNT });
 registerAccount(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerGames(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });
 registerChat(app, { requireFirebaseUser, firestoreReady: !!SERVICE_ACCOUNT });

@@ -23,9 +23,20 @@
 //   GET  /bowbound/gift/list    → { codes: [...] }        (admins)
 //   POST /bowbound/gift/cancel  { code }  → { ok }        (admins, unused codes)
 //   POST /bowbound/gift/redeem  { code }  → { ok }        (anyone signed in)
+//
+// Google Play: the Android app sells the same unlock as a one-off in-app
+// product (full_game). After a purchase (or "Restore purchase") the app sends
+// the purchase token here; we ask Google whether it's real and paid, then
+// write the same grants/{uid} record, so it unlocks the web too.
+//   POST /bowbound/play/verify  { purchaseToken, productId } → { ok }
+// Uses the service account the server already has for Google Play
+// (PLAY_SERVICE_ACCOUNT, else FIREBASE_SERVICE_ACCOUNT): it must be allowed
+// to see Bowbound's orders in Play Console (Users and permissions).
 
 import express from "express";
 import { createHmac, timingSafeEqual, randomInt } from "node:crypto";
+import { createHash, createSign } from "node:crypto";
+import axios from "axios";
 import rateLimit from "express-rate-limit";
 import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
@@ -75,6 +86,88 @@ export function grantFor(event) {
     return { skip: "no account", session: session.id };
   }
   return { uid, session: session.id, livemode: event.livemode === true };
+}
+
+// ---- Google Play ----
+
+export const PLAY_PACKAGE = "com.bowbound.bowbound";
+export const PLAY_PRODUCT = "full_game";
+
+/**
+ * What Google's record of a one-off purchase means for [uid]:
+ * { ok: true, orderId, needsAck } to grant, or { error, status }.
+ */
+export function playGrantFor(purchase, uid) {
+  if (!purchase || typeof purchase !== "object") return { error: "Google Play doesn't know that purchase.", status: 404 };
+  // 0 purchased, 1 cancelled (refunded), 2 pending (e.g. paying by cash).
+  if (purchase.purchaseState === 2) return { error: "The payment hasn't gone through yet.", status: 409 };
+  if (purchase.purchaseState !== 0) return { error: "That purchase was cancelled or refunded.", status: 410 };
+  // The app tags the purchase with the account that made it.
+  const owner = purchase.obfuscatedExternalAccountId;
+  if (owner && owner !== uid) {
+    return { error: "That purchase belongs to a different Bowbound account.", status: 409 };
+  }
+  return { ok: true, orderId: purchase.orderId || null, needsAck: purchase.acknowledgementState === 0 };
+}
+
+const b64url = (v) =>
+  Buffer.from(typeof v === "string" ? v : JSON.stringify(v))
+    .toString("base64")
+    .replace(/=+$/, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+
+/** A way to call the Play Developer API as [account] (a service account). */
+function playClient(account) {
+  let cached = null; // { token, expires }
+  async function accessToken() {
+    if (cached && cached.expires > Date.now() + 60_000) return cached.token;
+    const now = Math.floor(Date.now() / 1000);
+    const unsigned =
+      `${b64url({ alg: "RS256", typ: "JWT" })}.` +
+      b64url({
+        iss: account.client_email,
+        scope: "https://www.googleapis.com/auth/androidpublisher",
+        aud: "https://oauth2.googleapis.com/token",
+        iat: now,
+        exp: now + 3600,
+      });
+    const signature = createSign("RSA-SHA256")
+      .update(unsigned)
+      .sign(account.private_key, "base64")
+      .replace(/=+$/, "")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_");
+    const r = await axios.post(
+      "https://oauth2.googleapis.com/token",
+      new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion: `${unsigned}.${signature}`,
+      }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 }
+    );
+    cached = { token: r.data.access_token, expires: Date.now() + (Number(r.data.expires_in) || 3600) * 1000 };
+    return cached.token;
+  }
+  const base =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${PLAY_PACKAGE}` +
+    `/purchases/products/${PLAY_PRODUCT}/tokens/`;
+  return {
+    async get(purchaseToken) {
+      const r = await axios.get(base + encodeURIComponent(purchaseToken), {
+        headers: { Authorization: `Bearer ${await accessToken()}` },
+        timeout: 15000,
+      });
+      return r.data;
+    },
+    async acknowledge(purchaseToken) {
+      await axios.post(
+        `${base}${encodeURIComponent(purchaseToken)}:acknowledge`,
+        {},
+        { headers: { Authorization: `Bearer ${await accessToken()}` }, timeout: 15000 }
+      );
+    },
+  };
 }
 
 // ---- Gift codes ----
@@ -129,8 +222,11 @@ function readServiceAccount(raw) {
 }
 
 /** Adds the Bowbound route. Its path must skip the JSON body parser (raw body). */
-export function registerBowbound(app) {
+export function registerBowbound(app, { playServiceAccount } = {}) {
   const account = readServiceAccount(process.env.BOWBOUND_FIREBASE_SERVICE_ACCOUNT);
+  // Google Play access: the server's own Play account, else its main one.
+  const playAccount = readServiceAccount(process.env.PLAY_SERVICE_ACCOUNT) || playServiceAccount || null;
+  const play = playAccount?.client_email && playAccount?.private_key ? playClient(playAccount) : null;
   const secret = process.env.BOWBOUND_STRIPE_WEBHOOK_SECRET;
   let db = null;
   let auth = null;
@@ -140,7 +236,7 @@ export function registerBowbound(app) {
     db = getFirestore(fb);
     auth = getAuth(fb);
   }
-  console.log(`[bowbound] ${db && secret ? "on" : "off (settings missing)"}`);
+  console.log(`[bowbound] ${db && secret ? "on" : "off (settings missing)"}, Google Play ${db && play ? "on" : "off"}`);
 
   app.post(WEBHOOK_PATH, express.raw({ type: "application/json" }), async (req, res) => {
     if (!db || !secret) return res.status(503).send("Bowbound billing not configured");
@@ -309,6 +405,73 @@ export function registerBowbound(app) {
     } catch (err) {
       console.error("[bowbound/gift/redeem]", err.message || err);
       return res.status(500).json({ error: "Couldn't use that code. Try again." });
+    }
+  });
+
+  // ---- Google Play ----
+
+  const playLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 30,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    keyGenerator: (req) => (req.bowUser?.uid ? `bowplay:${req.bowUser.uid}` : `ip:${req.ip}`),
+    message: { error: "Too many tries. Try again in an hour." },
+  });
+
+  // The app, straight after a purchase or "Restore purchase".
+  app.post("/bowbound/play/verify", needUser, playLimiter, async (req, res) => {
+    if (!play) return res.status(503).json({ error: "Not available right now." });
+    const uid = req.bowUser.uid;
+    const purchaseToken = String(req.body?.purchaseToken || "");
+    if (req.body?.productId !== PLAY_PRODUCT || purchaseToken.length < 20 || purchaseToken.length > 2000) {
+      return res.status(400).json({ error: "That isn't a Bowbound purchase." });
+    }
+    let purchase;
+    try {
+      purchase = await play.get(purchaseToken);
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 400 || status === 404 || status === 410) {
+        return res.status(404).json({ error: "Google Play doesn't know that purchase." });
+      }
+      console.error("[bowbound/play/verify] Google said:", status || err.message);
+      return res.status(502).json({ error: "Couldn't reach Google Play. Try again in a moment." });
+    }
+    const verdict = playGrantFor(purchase, uid);
+    if (!verdict.ok) return res.status(verdict.status).json({ error: verdict.error });
+    try {
+      // One purchase, one account: the first account to claim a token keeps it.
+      const tokenRef = db.collection("playPurchases").doc(createHash("sha256").update(purchaseToken).digest("hex"));
+      const claimed = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(tokenRef);
+        const owner = snap.data()?.uid;
+        if (owner && owner !== uid) return false;
+        if (!owner) tx.set(tokenRef, { uid, order: verdict.orderId, at: FieldValue.serverTimestamp() });
+        tx.set(
+          db.collection("grants").doc(uid),
+          { full: true, source: "play", order: verdict.orderId, at: FieldValue.serverTimestamp() },
+          { merge: true }
+        );
+        return true;
+      });
+      if (!claimed) {
+        return res.status(409).json({ error: "That purchase is already on a different Bowbound account." });
+      }
+      // Google refunds a purchase nobody acknowledges within 3 days. The app
+      // acknowledges too; whichever is first wins.
+      if (verdict.needsAck) {
+        try {
+          await play.acknowledge(purchaseToken);
+        } catch (err) {
+          console.warn("[bowbound/play] acknowledge failed:", err.response?.status || err.message);
+        }
+      }
+      console.log(`[bowbound/play] ${uid} unlocked the full game`);
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[bowbound/play/verify]", err.message || err);
+      return res.status(500).json({ error: "Couldn't record the purchase. Try again." });
     }
   });
 }

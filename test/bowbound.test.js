@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { signedByStripe, grantFor, isBowboundAdmin, newCode, normaliseCode, displayCode } from "../bowbound.js";
+import { signedByStripe, grantFor, isBowboundAdmin, newCode, normaliseCode, displayCode, playGrantFor } from "../bowbound.js";
 
 const secret = "whsec_test";
 const body = Buffer.from(JSON.stringify({ type: "checkout.session.completed" }));
@@ -60,4 +60,15 @@ test("only the listed, verified emails are admins", () => {
   assert.equal(isBowboundAdmin(null, ""), false);
   assert.equal(isBowboundAdmin(u("vegthetics@gmail.com"), "other@x.com"), false); // the setting replaces the list
   assert.equal(isBowboundAdmin(u("other@x.com"), "other@x.com"), true);
+});
+
+test("a Google Play purchase unlocks only when paid, and only for its own account", () => {
+  const bought = { purchaseState: 0, acknowledgementState: 0, orderId: "GPA.1", obfuscatedExternalAccountId: "uidA" };
+  assert.deepEqual(playGrantFor(bought, "uidA"), { ok: true, orderId: "GPA.1", needsAck: true });
+  assert.equal(playGrantFor({ ...bought, acknowledgementState: 1 }, "uidA").needsAck, false);
+  assert.equal(playGrantFor({ ...bought, obfuscatedExternalAccountId: undefined }, "uidB").ok, true); // untagged: allowed
+  assert.equal(playGrantFor(bought, "uidB").status, 409); // someone else's
+  assert.equal(playGrantFor({ ...bought, purchaseState: 2 }, "uidA").status, 409); // pending
+  assert.equal(playGrantFor({ ...bought, purchaseState: 1 }, "uidA").status, 410); // refunded
+  assert.equal(playGrantFor(null, "uidA").status, 404);
 });
